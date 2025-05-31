@@ -1,15 +1,26 @@
 #!/bin/bash
 set -euo pipefail
 
-cat <<EOF > "/etc/slurpload.json"
-{
-    "host": "${postgres_internal_ip}",
-    "port": 5432,
-    "user": "slurpload",
-    "password": "${slurpload_db_password}",
-    "dbname": "ctlogs",
-    "sslmode": "disable"
-}
+cat <<EOF > "/etc/slurpload.yaml"
+database:
+  host: "${postgres_internal_ip}"
+  port: 5432
+  username: "slurpload"
+  password: "${slurpload_db_password}"
+  database: "ctlogs"
+  ssl_mode: "disable"
+  max_conns: 16
+  batch_size: 256
+  cache_size: 1_000_000
+
+server:
+  listen_addr: "0.0.0.0:${slurpload_port}"
+
+processing:
+  inbox_dir: "/tmp/slurpload"
+
+metrics:
+  log_stat_every: 10_000
 EOF
 
 mkdir -p /tmp/slurpload
@@ -23,7 +34,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/slurpload serve --http 0.0.0.0:${slurpload_port} --inbox /tmp/slurpload --config /etc/slurpload.json
+ExecStart=/usr/bin/slurpload serve --config /etc/slurpload.yaml
 Restart=always
 RestartSec=5
 User=azureuser
