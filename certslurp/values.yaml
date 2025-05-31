@@ -1,0 +1,28 @@
+image:
+  repository: <youracr>.azurecr.io/certslurpd
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+certslurp:
+  cluster_key: ""
+  api_tokens: "slurpsecret"
+
+head:
+  enabled: true
+  replicas: 2
+
+worker:
+  enabled: true
+  replicas: 512
+
+etcd:
+  root_password: changeme
+  user: certslurpapp
+  user_password: s3cr3t
+
+  image: bitnami/etcd:3.5.17
+  replicas: 3
+  storage:
+    enabled: true
+    size: 20Gi
+    storageClassName: ""

@@ -1,0 +1,11 @@
+subscription_id = "azure subscription id"
+location        = "eastus2"
+resource_group  = "certslurp"
+
+ssh_public_key = "your ssh public key"
+
+db_user_name     = "read/query db user"
+db_user_password = "read/query db user password"
+
+slurpload_db_password = "slurpload db password (ingestion)"
+slurpload_port        = "8080"
