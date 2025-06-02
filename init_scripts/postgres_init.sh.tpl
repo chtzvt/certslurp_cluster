@@ -12,16 +12,31 @@ echo "==> Cloud-init: Begin postgresql data disk setup"
 apt-get update
 apt-get install -y xfsprogs parted gnupg curl
 
+for i in {1..30}; do
+    if [ -b "$DEVICE" ]; then break; fi
+    echo "Waiting for $DEVICE to appear..."
+    sleep 1
+done
+if [ ! -b "$DEVICE" ]; then
+    echo "ERROR: Device $DEVICE not found after waiting"
+    exit 1
+fi
+
 # Format and mount disk if not already mounted
-if ! grep -qs "$\{MOUNT_POINT\}" /proc/mounts; then
+if ! grep -qs "$MOUNT_POINT" /proc/mounts; then
     echo "==> Partitioning and formatting data disk"
-    parted -s $\{DEVICE\} mklabel gpt
-    parted -s -a optimal $\{DEVICE\} mkpart primary xfs 0% 100%
-    PARTITION="$\{DEVICE\}-part1"
-    mkfs.xfs -f $\{PARTITION\}
-    mkdir -p "$\{MOUNT_POINT\}"
-    echo "$\{PARTITION\} $\{MOUNT_POINT\} xfs defaults,nofail 0 2" >> /etc/fstab
-    mount "$\{MOUNT_POINT\}"
+    parted -s $DEVICE mklabel gpt
+    parted -s -a optimal $DEVICE mkpart primary xfs 0% 100%
+    sleep 2
+    PARTITION="${DEVICE}-part1"
+    if [ ! -b "$PARTITION" ]; then
+    echo "ERROR: Partition $PARTITION not found after partitioning $DEVICE"
+    exit 1
+    fi
+    mkfs.xfs -f "$PARTITION"
+    mkdir -p "$MOUNT_POINT"
+    echo "$PARTITION $MOUNT_POINT xfs defaults,nofail,noatime,nodiratime 0 2" >> /etc/fstab
+    mount "$MOUNT_POINT"
 fi
 
 # Install PostgreSQL
@@ -30,20 +45,20 @@ if ! command -v psql >/dev/null; then
     sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
     curl https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add -
     apt-get update
-    apt-get install -y postgresql-$\{PG_VERSION\}
+    apt-get install -y postgresql-$PG_VERSION
 fi
 
 systemctl stop postgresql
 
 # Move/initialize PGDATA on the data disk
-if [ ! -d "$\{PG_DATA\}" ]; then
+if [ ! -d "$PG_DATA" ]; then
     echo "==> Initializing PostgreSQL data directory"
-    mkdir -p "$\{PG_DATA\}"
-    chown postgres:postgres "$\{PG_DATA\}"
-    sudo -u postgres /usr/lib/postgresql/$\{PG_VERSION\}/bin/initdb -D "$\{PG_DATA\}"
+    mkdir -p "$PG_DATA"
+    chown postgres:postgres "$PG_DATA"
+    sudo -u postgres /usr/lib/postgresql/$PG_VERSION/bin/initdb -D "$PG_DATA"
 fi
 
-PG_CONF="/etc/postgresql/$\{PG_VERSION\}/main/postgresql.conf"
+PG_CONF="/etc/postgresql/$PG_VERSION/main/postgresql.conf"
 
 # Only append new tunings if not already present (idempotent)
 grep -q "CERTSLURP TUNING" "$PG_CONF" || cat <<EOF >> "$PG_CONF"
@@ -97,18 +112,18 @@ log_min_duration_statement = 1000  # Log slow queries (ms)
 EOF
 
 # Point PostgreSQL at the new data directory (override data_directory)
-if ! grep -q "^data_directory = '$\{PG_DATA\}'" "$PG_CONF"; then
-    sed -i "s|^#*data_directory =.*|data_directory = '$\{PG_DATA\}'|" "$PG_CONF"
+if ! grep -q "^data_directory = '$PG_DATA'" "$PG_CONF"; then
+    sed -i "s|^#*data_directory =.*|data_directory = '$PG_DATA'|" "$PG_CONF"
 fi
 
 # Allow access from anywhere (or restrict as needed)
-PG_HBA="/etc/postgresql/$\{PG_VERSION\}/main/pg_hba.conf"
+PG_HBA="/etc/postgresql/$PG_VERSION/main/pg_hba.conf"
 if ! grep -q "^host all all 0.0.0.0/0 md5" "$PG_HBA"; then
     echo "host all all 0.0.0.0/0 md5" >> "$PG_HBA"
 fi
 
 # Set proper permissions
-chown -R postgres:postgres "$\{PG_DATA\}"
+chown -R postgres:postgres "$PG_DATA"
 
 systemctl daemon-reload
 systemctl enable postgresql
