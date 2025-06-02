@@ -287,8 +287,8 @@ resource "azurerm_kubernetes_cluster" "main" {
 
   default_node_pool {
     name           = "nodepool1"
-    node_count     = 6
-    vm_size        = "Standard_DS3_v2"
+    node_count     = 3
+    vm_size        = "Standard_B16als_v2"
     vnet_subnet_id = azurerm_subnet.aks.id
   }
 
@@ -333,7 +333,7 @@ resource "azurerm_linux_virtual_machine" "slurpload" {
   name                  = "slurpload-vm"
   resource_group_name   = azurerm_resource_group.main.name
   location              = local.location
-  size                  = "Standard_DS3_v2"
+  size                  = "Standard_B8als_v2"
   admin_username        = "azureuser"
   network_interface_ids = [azurerm_network_interface.slurpload.id]
 
@@ -392,7 +392,7 @@ resource "azurerm_managed_disk" "postgres_data" {
   name                 = "postgres-data-disk"
   location             = local.location
   resource_group_name  = azurerm_resource_group.main.name
-  storage_account_type = "StandardSSD_LRS"
+  storage_account_type = "Premium_LRS"
   disk_size_gb         = 8192
 }
 
@@ -400,7 +400,7 @@ resource "azurerm_linux_virtual_machine" "postgres" {
   name                  = "postgres-vm"
   resource_group_name   = azurerm_resource_group.main.name
   location              = local.location
-  size                  = "Standard_DS4_v2"
+  size                  = "Standard_E8as_v5"
   admin_username        = "azureuser"
   network_interface_ids = [azurerm_network_interface.postgres.id]
 
