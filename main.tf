@@ -155,7 +155,7 @@ resource "azurerm_subnet" "postgres" {
 
 # Multiple public IPs for NAT Gateway
 resource "azurerm_public_ip" "nat" {
-  count               = 8 # Up to 16 per NAT Gateway
+  count               = 10 # Up to 16 per NAT Gateway
   name                = "aks-nat-ip-${count.index}"
   location            = local.location
   resource_group_name = azurerm_resource_group.main.name
