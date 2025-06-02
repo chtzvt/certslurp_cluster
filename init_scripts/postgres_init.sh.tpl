@@ -63,19 +63,28 @@ max_wal_senders = 5
 wal_keep_size = 2GB
 
 # Autovacuum tuning
-autovacuum = on
-autovacuum_max_workers = 5
-autovacuum_naptime = 10s
-autovacuum_vacuum_scale_factor = 0.02
-autovacuum_analyze_scale_factor = 0.01
-autovacuum_vacuum_cost_limit = 2000
-autovacuum_vacuum_cost_delay = 5ms
+# Aggressive, best for post-bulk load
+#autovacuum = on
+#autovacuum_max_workers = 5
+#autovacuum_naptime = 10s
+#autovacuum_vacuum_scale_factor = 0.02
+#autovacuum_analyze_scale_factor = 0.01
+#autovacuum_vacuum_cost_limit = 2000
+#autovacuum_vacuum_cost_delay = 5ms
+
+# Best for during bulk load
+autovacuum_vacuum_scale_factor = 0.5   
+autovacuum_analyze_scale_factor = 0.10 
+autovacuum_naptime = 30s  
+autovacuum_max_workers = 2  
+autovacuum_vacuum_cost_limit = 1000  
+autovacuum_vacuum_cost_delay = 25ms
 
 # Memory for caching/bulk loading
-shared_buffers = 4GB
-work_mem = 32MB
-maintenance_work_mem = 2GB
-effective_cache_size = 12GB
+shared_buffers = 20GB
+work_mem = 128MB
+maintenance_work_mem = 4GB
+effective_cache_size = 48GB
 
 # Background writer
 bgwriter_delay = 10ms
@@ -83,7 +92,7 @@ bgwriter_lru_maxpages = 1000
 bgwriter_lru_multiplier = 4.0
 
 # Other
-max_connections = 200
+max_connections = 500
 log_min_duration_statement = 1000  # Log slow queries (ms)
 EOF
 
