@@ -136,26 +136,26 @@ resource "azurerm_subnet" "aks" {
   name                 = "aks-subnet"
   resource_group_name  = azurerm_resource_group.main.name
   virtual_network_name = azurerm_virtual_network.main.name
-  address_prefixes     = ["10.0.1.0/24"]
+  address_prefixes     = ["10.0.0.0/22"]
 }
 
 resource "azurerm_subnet" "slurpload" {
   name                 = "slurpload-subnet"
   resource_group_name  = azurerm_resource_group.main.name
   virtual_network_name = azurerm_virtual_network.main.name
-  address_prefixes     = ["10.0.2.0/24"]
+  address_prefixes     = ["10.0.4.0/24"]
 }
 
 resource "azurerm_subnet" "postgres" {
   name                 = "postgres-subnet"
   resource_group_name  = azurerm_resource_group.main.name
   virtual_network_name = azurerm_virtual_network.main.name
-  address_prefixes     = ["10.0.3.0/24"]
+  address_prefixes     = ["10.0.5.0/24"]
 }
 
 # Multiple public IPs for NAT Gateway
 resource "azurerm_public_ip" "nat" {
-  count               = 10 # Up to 16 per NAT Gateway
+  count               = 12 # Up to 16 per NAT Gateway
   name                = "aks-nat-ip-${count.index}"
   location            = local.location
   resource_group_name = azurerm_resource_group.main.name
@@ -286,10 +286,15 @@ resource "azurerm_kubernetes_cluster" "main" {
   dns_prefix          = "certslurp"
 
   default_node_pool {
-    name           = "nodepool1"
-    node_count     = 3
-    vm_size        = "Standard_B16als_v2"
-    vnet_subnet_id = azurerm_subnet.aks.id
+    name                        = "nodepool1"
+    temporary_name_for_rotation = "certslurptmp"
+    node_count                  = 3
+    max_pods                    = 80
+    vm_size                     = "Standard_B16als_v2"
+    vnet_subnet_id              = azurerm_subnet.aks.id
+
+    # For high node counts, disk IOPS are a severe bottleneck for etcd
+    ultra_ssd_enabled = true
   }
 
   identity {
