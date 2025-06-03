@@ -28,7 +28,7 @@ if ! grep -qs "$MOUNT_POINT" /proc/mounts; then
     parted -s $DEVICE mklabel gpt
     parted -s -a optimal $DEVICE mkpart primary xfs 0% 100%
     sleep 2
-    PARTITION="${DEVICE}-part1"
+    PARTITION="$DEVICE-part1"
     if [ ! -b "$PARTITION" ]; then
     echo "ERROR: Partition $PARTITION not found after partitioning $DEVICE"
     exit 1
@@ -161,5 +161,7 @@ EOF
 
 PGPASSWORD=${slurpload_db_password} psql -h localhost -U slurpload -d ctlogs -c '\conninfo'
 PGPASSWORD=${db_user_password} psql -h localhost -U ${db_user_name} -d ctlogs -c '\conninfo'
+
+PGPASSWORD=${slurpload_db_password} psql -h localhost -U slurpload -d ctlogs -c 'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO ${db_user_name};'
 
 echo "==> Cloud-init: PostgreSQL installation and disk setup complete"
