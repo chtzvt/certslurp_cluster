@@ -60,14 +60,16 @@ kubectl get nodes
 
 Deploy or upgrade with necessary parameters:
 
+```
 helm upgrade --install certslurp ./certslurp \
-  --set image.repository=certslurp7623.azurecr.io/certslurp/certslurpd \
+  --set image.repository=<acr>.azurecr.io/certslurp/certslurpd \
   --set image.tag=latest \
-  --set worker.replicas=512 \    # Or scale as needed
+  --set worker.replicas=X \
   --set etcd.root_password='...' \
   --set etcd.user_password='...' \
   --set certslurp.cluster_key='...' \
   --set certslurp.api_tokens='...'
+```
 
 Tip: You can override values in values.yaml using --set. Make sure you restart or redeploy pods if you change secrets/env vars!
 
