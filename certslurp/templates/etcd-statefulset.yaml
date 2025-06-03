@@ -13,6 +13,13 @@ spec:
       labels:
         app: etcd
     spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: etcd
+              topologyKey: "kubernetes.io/hostname"
       securityContext:
           fsGroup: 1001
       containers:

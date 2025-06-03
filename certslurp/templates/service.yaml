@@ -14,7 +14,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: certslurpd-head
+  name: certslurpd-head-api
 spec:
   selector:
     app: certslurpd-head
