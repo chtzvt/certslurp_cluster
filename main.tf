@@ -288,13 +288,16 @@ resource "azurerm_kubernetes_cluster" "main" {
   default_node_pool {
     name                        = "nodepool1"
     temporary_name_for_rotation = "certslurptmp"
-    node_count                  = 3
-    max_pods                    = 80
-    vm_size                     = "Standard_B16als_v2"
-    vnet_subnet_id              = azurerm_subnet.aks.id
+
+    # Note: MUST have at least as many nodes as etd pods
+    node_count     = 3
+    max_pods       = 80
+    vm_size        = "Standard_B16als_v2"
+    vnet_subnet_id = azurerm_subnet.aks.id
 
     # For high node counts, disk IOPS are a severe bottleneck for etcd
     ultra_ssd_enabled = true
+    zones             = [1]
   }
 
   identity {
