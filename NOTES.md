@@ -184,3 +184,23 @@ If you’re troubleshooting, always start with:
 To forward ports for certslurpctl:
 
 kubectl port-forward deployment/certslurpd-head 8080:8080
+
+
+To check which nodes etc pods are running on:
+
+```
+kubectl get pods -l app=etcd -o wide
+```
+
+
+To port forward the certslurp API:
+
+```
+kubectl port-forward deployment/certslurpd-head 8080:8080
+```
+
+To scale the worker node count:
+
+```
+kubectl scale deployment certslurpd-worker --replicas=25
+```
