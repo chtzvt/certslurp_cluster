@@ -1,7 +1,7 @@
 image:
   repository: <youracr>.azurecr.io/certslurpd
   tag: "latest"
-  pullPolicy: IfNotPresent
+  pullPolicy: Always
 
 certslurp:
   cluster_key: ""
