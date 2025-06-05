@@ -159,6 +159,21 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${db_user_name};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO ${db_user_name};
 EOF
 
+cat >/etc/cron.d/pg_nightly_gin_cleanup <<EOF
+0 3 * * * postgres psql -d ctlogs -c "SELECT max(gin_clean_pending_list(psui.indexrelid)) FROM pg_stat_user_indexes psui WHERE psui.relname LIKE 'certificates%' AND psui.indexrelname LIKE '%dns_names%';" >>/var/log/pg_maintenance.log 2>&1
+EOF
+
+cat >/etc/cron.d/pg_weekly_reindex <<EOF
+0 4 * * 0 postgres psql -d ctlogs -c "REINDEX TABLE certificates;" >>/var/log/pg_maintenance.log 2>&1
+EOF
+
+cat >/etc/cron.d/pg_monthly_cluster <<EOF
+0 5 1 * * postgres psql -d ctlogs -c "CLUSTER VERBOSE certificates;" >>/var/log/pg_maintenance.log 2>&1
+EOF
+
+chmod 644 /etc/cron.d/pg_nightly_gin_cleanup /etc/cron.d/pg_weekly_reindex /etc/cron.d/pg_monthly_cluster
+service cron reload
+
 PGPASSWORD=${slurpload_db_password} psql -h localhost -U slurpload -d ctlogs -c '\conninfo'
 PGPASSWORD=${db_user_password} psql -h localhost -U ${db_user_name} -d ctlogs -c '\conninfo'
 
