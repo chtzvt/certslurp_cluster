@@ -11,13 +11,15 @@ database:
   ssl_mode: "disable"
   max_conns: 16
   batch_size: 256
-  cache_size: 1_000_000
 
 server:
   listen_addr: "0.0.0.0:${slurpload_port}"
 
 processing:
   inbox_dir: "/tmp/slurpload"
+  flush_thresh: 10_000_000
+  flush_limit: 100_000_000
+  inbox_poll: 1s
 
 metrics:
   log_stat_every: 10_000

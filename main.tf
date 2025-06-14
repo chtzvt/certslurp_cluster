@@ -294,10 +294,6 @@ resource "azurerm_kubernetes_cluster" "main" {
     max_pods       = 80
     vm_size        = "Standard_B16als_v2"
     vnet_subnet_id = azurerm_subnet.aks.id
-
-    # For high node counts, disk IOPS are a severe bottleneck for etcd
-    ultra_ssd_enabled = true
-    zones             = [1]
   }
 
   identity {
