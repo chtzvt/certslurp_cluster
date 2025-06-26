@@ -1,0 +1,5 @@
+subscription_id = "azure subscription id"
+location        = "eastus2"
+resource_group  = "certslurp"
+
+ssh_public_key = "your ssh public key"
