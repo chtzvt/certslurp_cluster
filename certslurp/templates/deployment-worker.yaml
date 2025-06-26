@@ -65,5 +65,12 @@ spec:
                   key: password
             - name: CERTSLURPD_ETCD__PREFIX
               value: "{{ .Values.certslurp.cluster_prefix | default "/certslurp" }}"
+            - name: CERTSLURPD_WORKER__POLL_PERIOD
+              value: "{{ .Values.worker.poll_period | default "10s" }}"
+            - name: CERTSLURPD_WORKER__PARALLELISM
+              value: "{{ .Values.worker.parallelism | default "4" }}"
             - name: CERTSLURPD_SECRETS__CLUSTER_KEY
-              value: "{{ .Values.certslurp.cluster_key }}"
+              valueFrom:
+                secretKeyRef:
+                  name: certslurpd-cluster-creds
+                  key: cluster_key

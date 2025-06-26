@@ -65,12 +65,18 @@ spec:
                   key: password
             - name: CERTSLURPD_ETCD__PREFIX
               value: "{{ .Values.certslurp.cluster_prefix | default "/certslurp" }}"
-            - name: CERTSLURPD_SECRETS__CLUSTER_KEY
-              value: "{{ .Values.certslurp.cluster_key }}"
             - name: CERTSLURPD_API__LISTEN_ADDR
               value: ":8080"
+            - name: CERTSLURPD_SECRETS__CLUSTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: certslurpd-cluster-creds
+                  key: cluster_key
             - name: CERTSLURPD_API__AUTH_TOKENS
-              value: "{{ .Values.certslurp.api_tokens }}"
+              valueFrom:
+                secretKeyRef:
+                  name: certslurpd-cluster-creds
+                  key: api_tokens
           ports:
             - containerPort: 8080
           livenessProbe:

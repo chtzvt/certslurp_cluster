@@ -13,7 +13,9 @@ head:
 
 worker:
   enabled: true
-  replicas: 512
+  replicas: 80
+  poll_period: "10s"
+  parallelism: "4"
 
 etcd:
   root_password: changeme
