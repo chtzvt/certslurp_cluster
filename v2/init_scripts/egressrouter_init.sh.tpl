@@ -30,7 +30,7 @@ echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-
 echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections || true
 echo ipset-persistent ipset-persistent/autosave boolean true | debconf-set-selections || true
 DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y \
-  iptables iptables-persistent conntrack ipset ipset-persistent
+  iptables iptables-persistent conntrack ipset ipset-persistent bmon nload iftop nethogs
 
 # --- Interface discovery ---
 MGMT_SUBNET="10.0.4."
