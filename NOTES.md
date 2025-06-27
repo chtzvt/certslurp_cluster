@@ -213,9 +213,9 @@ kubectl exec -it etcd-0 -- /bin/sh
 ```
 
 ```
-etcdctl --user "root:$ETCD_ROOT_PASSWORD" --endpoints=localhost:2379,etcd-1.etcd-headless.default.svc.cluster.local:2379,etcd-2.etcd-headless.default.svc.cluster.local:2379 endpoint health
+etcdctl --dial-timeout=5s --user "root:$ETCD_ROOT_PASSWORD" --endpoints=localhost:2379,etcd-1.etcd-headless.default.svc.cluster.local:2379,etcd-2.etcd-headless.default.svc.cluster.local:2379 endpoint health
 ```
 
 ```
-etcdctl --user "root:$ETCD_ROOT_PASSWORD" --endpoints=localhost:2379,etcd-1.etcd-headless.default.svc.cluster.local:2379,etcd-2.etcd-headless.default.svc.cluster.local:2379 endpoint status --write-out=table
+etcdctl --dial-timeout=5s --user "root:$ETCD_ROOT_PASSWORD" --endpoints=localhost:2379,etcd-1.etcd-headless.default.svc.cluster.local:2379,etcd-2.etcd-headless.default.svc.cluster.local:2379 endpoint status --write-out=table
 ```
