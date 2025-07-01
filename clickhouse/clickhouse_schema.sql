@@ -1,194 +1,228 @@
 /*-----------------------------------------------------------------------
- Certificate-to-Technology Analytics Schema  –  2025-06-30
+Certificate-to-Technology Analytics Schema  – 2025-07-01
 -----------------------------------------------------------------------
 
-               CT logs → certslurp archives → ct_certificates
-                                                            │
-                    ┌───────────────────────────────────────┤ 1️⃣  Bloom + PSL
-                    │           [mv_dns_flat]               │
-                    │    (adds org_id, registrable, root)   ▼
-┌─ tiny edit table  │     dict_tech_patterns  (HASHED dict)       ←── live reload
-│   + versioning    └───────────────────────────────────────┐
-                    │ 2️⃣  pattern match (token / regex)      │
-                    ▼                                        │
-        [mv_ct_tech_signals]  ──▶  tech_signals ◀─ Rails / scans / APIs
-                                   ▲      ▲
-                                   │ 3️⃣  │ bitmap merge
-                                   │      │
-                        [mv_org_tech]  (AggregatingMergeTree)
-                                   │
-                                   ▼
-                          org_tech_facts  (read-only view)
+End-to-end analytics pipeline for extracting, clustering, and analyzing certificate transparency logs to detect technology use by organization. 
+Schema is designed for high-volume ingest, append-only safety, efficient surrogate keys, rapid fuzzy/org lookup, and scalable heuristics—leveraging ClickHouse 
+refreshable materialized views for automatic periodic rollup, aliasing, and autocomplete.
 
-Low-latency dictionaries
-  • dict_tech_patterns 
-  • dict_org_autocomplete   – distinct organisation strings
-  • dict_org_roots          – org_id → root-domain list
+________________________________________________________________________
+DATA FLOW & ARCHITECTURE
+________________________________________________________________________
 
-Surrogate keys
-  • org_id = UInt64  = sipHash64(norm_token_key(org_string))
-    All heavy joins, group-bys and dictionaries use this hash.
+CT logs → certslurp archives → ct_certificates
+                        │
+        ┌───────────────┴────────────────────────────────────────┐
+        │   [mv_dns_flat] (per-SAN)                              │
+        │   + PSL: org_id, root, etc                             │ 
+dict_tech_patterns (HASHED dictionary) ←── tiny, versioned       │
+        │                                                        ▼
+        ▼                                           [pattern/token/regex match]
+ [mv_ct_tech_signals] ─────────────────────────────────────→ tech_signals ←── external scan/API
+        ▲                                                        ▲
+        │                                                        │ merges & suppression
+        │                                                        │
+  [mv_org_tech]                                       (AggregatingMergeTree)
+        │
+        ▼
+ org_tech_facts (read-only, deduped)
+
+
+Org clustering, autocomplete & aliasing:
+
+    mv_org_roots → org_root_sets (periodic refresh)
+    │
+    └─→ org_alias_map (periodic refresh)
+    └─→ org_autocomplete_clustered (periodic refresh)
+
+All organizational grouping uses org_id (UInt64; deterministic SipHash64 of normalized tokens) for speed and deduplication.
 
 ________________________________________________________________________
 TABLE & VIEW GLOSSARY
 ________________________________________________________________________
 
-1)  ct_certificates  (MergeTree, raw ingest)
-    • One row per *certificate* scraped by certslurp
-    • Partition:  toYYYYMM(lts)   (append-only; lts = log timestamp)
-    • ORDER BY:   (log, li)       (natural ingest order)
-    • Indexes:    idx_dns_bloom  (Bloom on Array(String) dns)
-                  idx_issuer     (token Bloom on issuer)
-    • Codecs:     ZSTD(3) on free-text, LowCardinality(log)
+1. ct_certificates  (MergeTree, raw ingest)
+ - One row per certificate scraped by certslurp
+ - Partitioned by toYYYYMM(lts) (append-only; lts = log timestamp)
+ - All multi-value fields (org, dns, etc) are arrays.
+ - Indexes:  Bloom on Array(String) dns; token Bloom on issuer
 
-2)  mv_dns_flat  (ReplacingMergeTree)
-    • One row per **SAN domain**
-    • Derived columns
-        dn           – lower-cased SAN
-        org_id       – surrogate UInt64 key
-        registrable  – PSL “google.co.uk”
-        root         – “google”  (first significant)
-        dn_tokens    – token array of root
-    • Purpose: fast domain & country filters; feeds heuristics.
+2. mv_dns_flat  (ReplacingMergeTree)
+ - One row per SAN domain
+ - Derived columns: dn (SAN), org_id, registrable (PSL), root, token arrays
+ - Purpose: fast domain & country filters; feeds heuristics.
 
-3)  mv_org_cert  (MergeTree)
-    • One row per (org_id , certificate)
-    • Avoids `arrayJoin` at query time for exact org look-ups.
+3. mv_org_cert  (MergeTree)
+ - One row per (org_id, certificate)
+ - Avoids arrayJoin at query time for exact org lookups.
 
-4)  mv_org_signatures  (AggregatingMergeTree)
-    • SipHash64 + bitmap(cert_sn) per (norm_key, org_id)
-    • Supports fuzzy “organisation similarity” searches in ≤ 0.2 s.
+4. mv_org_signatures  (AggregatingMergeTree)
+ - SipHash64 + bitmap(cert_sn) per (norm_key, org_id)
+ - Supports fuzzy org similarity/autocomplete in milliseconds.
 
-5)  mv_org_roots  (AggregatingMergeTree)
-    • Pre-deduped list of *registrable* domains for each org_key
-    • Drives dictionary `dict_org_roots` (flat in-RAM).
+5. mv_org_roots  (AggregatingMergeTree)
+ - Pre-deduped list of registrable domains for each org_id
+ - Drives org_root_sets, which feeds alias clustering.
 
-6)  dict_org_autocomplete  /  dict_org_roots  (FLAT dictionaries)
-    • RAM hash-maps for sub-ms API endpoints (autocomplete, roots).
+6. org_root_sets  (periodically refreshed MergeTree)
+ - Most recent root domain set per org_id (one row per org)
+ - Refreshed automatically; do not manually insert.
 
-__ Technology matching layer ___________________________________________
+7. org_alias_map  (periodically refreshed MergeTree)
+ - All pairs of org_ids sharing ≥2 registrable roots
+ - Used for alias/cluster detection and autocomplete grouping.
 
-A) tech_patterns/dict_tech_patterns  (TinyLog + HASHED dictionary)
-   • Editable token / regex → technology + weight.
-   • Columns  updated_at  &  version  for audit / rollback.
+8. org_autocomplete_clustered  (periodically refreshed MergeTree)
+ - Autocomplete table: cluster_id, aliases, display_name, cert_count
+ - Used for fuzzy org lookup, UI, reporting.
 
-B) mv_ct_tech_signals  →  tech_signals  (MergeTree sink)
-   • Every domain in `mv_dns_flat` is matched against
-     `dict_tech_patterns` (token or regex).
-   • Emits one *signal* row: ts, org_key, registrable, tech,
-      confidence, structured evidence Array(Tuple(type,value)),
-      is_negative flag for suppressing stale techs.
+9. tech_patterns/dict_tech_patterns/dict_regex_prefixes
+ - Editable patterns and live-reload dictionaries for token/regex → tech mapping.
 
-   External workers insert additional signals with
-   `source` = 'active_scan' | 'proxycurl' etc.
+10. tech_signals  (MergeTree)
+ - All technology “signals” (from heuristics + external sources)
+ - Evidence, source, confidence, is_negative fields
 
-C) mv_org_tech  (AggregatingMergeTree)
-   • Aggregates signals into *one row per (org_key, tech)*
-     keeping max(confidence) and last_seen timestamp.
-   • Constant size w.r.t. signal volume.
+11. mv_ct_tech_signals_token / mv_ct_tech_signals_regex
+ - Insert tech_signals from token and regex matches in mv_dns_flat.
 
-D) org_tech_facts  (view)
-   • Final, query-ready table:
-       org_key | tech | confidence | last_seen
+12. mv_org_tech / org_tech_facts (AggregatingMergeTree/view)
+ - One row per (org_id, tech); highest-confidence, deduped
+ - API and reporting table
+
+13. etl_ingest_metrics
+ - All ETL/ingest job runs (row count, duration, errors, partition, etc.)
+
+14. mv_partition_stats, slow_queries
+ - System-level metrics and performance diagnostics
 
 ________________________________________________________________________
 TYPICAL QUERY PATTERNS
 ________________________________________________________________________
 
-•  What techs does Org X run?
-     SELECT * FROM org_tech_facts
-     WHERE org_key = norm_token_key('acme inc') AND confidence ≥ 0.5;
+* What techs does Org X run?
+SELECT * FROM org_tech_facts
+WHERE org_id = org_id(‘acme inc’) AND confidence >= 0.5;
 
-•  Which orgs appear to run GitLab in DE + CH?
-     SELECT any(one_example) AS org_sample, confidence
-     FROM org_tech_facts
-     ANY INNER JOIN mv_org_signatures USING (org_key)
-     WHERE tech='GitLab'
-       AND org_key IN (
-           SELECT norm_key FROM mv_dns_flat
-           WHERE country IN ('DE','CH')
-         );
+* Which orgs appear to run GitLab in DE + CH?
+SELECT any(one_example) AS org_sample, confidence
+FROM org_tech_facts
+ANY INNER JOIN mv_org_signatures USING (org_id)
+WHERE tech=‘GitLab’
+AND org_id IN (
+SELECT org_id FROM dns_flat
+WHERE country IN (‘DE’,‘CH’)
+);
 
-•  Growth of *.bitbucket* registrable domains in JP:
-     SELECT toStartOfMonth(nbf) AS month,
-            uniqExact(registrable) AS n
-     FROM mv_dns_flat
-     WHERE country='JP' AND dn ILIKE '%bitbucket%'
-     GROUP BY month ORDER BY month;
+* Growth of .bitbucket registrable domains in JP:
+SELECT toStartOfMonth(nbf) AS month,
+uniqExact(registrable) AS n
+FROM dns_flat
+WHERE country=‘JP’ AND dn ILIKE ‘%bitbucket%’
+GROUP BY month ORDER BY month;
+
+* Recent ETL job runs and durations:
+SELECT * FROM etl_ingest_metrics
+ORDER BY ts DESC
+LIMIT 25;
+
+* Average ingest duration for a table/job:
+SELECT job_name, table_name, avg(duration_ms) AS avg_ms
+FROM etl_ingest_metrics
+WHERE ts > now() - INTERVAL 7 DAY
+GROUP BY job_name, table_name;
+
+* Error summary for last 24h:
+SELECT ts, job_name, error
+FROM etl_ingest_metrics
+WHERE error != ‘’
+ORDER BY ts DESC;
+
+* Per-table partition sizes (latest):
+SELECT table, partition, rows, bytes
+FROM mv_partition_stats
+ORDER BY table, partition DESC;
+
+* Largest partitions by bytes:
+SELECT table, partition, rows, bytes
+FROM mv_partition_stats
+ORDER BY bytes DESC
+LIMIT 10;
+
+* Investigate active merges/mutations/TTL:
+SELECT table, partition_id, progress, is_mutation, elapsed
+FROM system.merges
+WHERE active = 1;
+
+* Check ongoing TTL moves:
+SELECT * FROM system.ttl_moves WHERE table = ‘ct_certificates’;
+
+* Show long-running queries:
+SELECT * FROM slow_queries
+WHERE query_duration_ms > 10000
+ORDER BY event_time DESC
+LIMIT 10;
+
+* Show current org alias clusters:
+SELECT * FROM org_autocomplete_clustered
+WHERE length(aliases) > 1
+ORDER BY cert_count DESC;
 
 ________________________________________________________________________
 PERFORMANCE CONSIDERATIONS
 ________________________________________________________________________
 
-✓  **Append-only ingest path** – partitions by `lts`; no in-flight duplicates.
-
-✓  Surrogate **org_id (UInt64)** — replaces long strings in joins/dicts,
-   cutting memory and index size ~30 %.
-
-✓  **Single-part inserts** – `min_bytes_for_wide_part=128 MB`
-    ensures each archive writes one “wide” part → minimal merge churn.
-
-✓  **Bloom / tokenbf** – prunes > 95 % of rows for substring filters
-    on `dn` and `iss`.
-
-✓  **Public Suffix helpers** – `registrable`, `root` computed with
-    built-in PSL, eliminating fragile `split('.')`.
-
-✓  **AggregatingMergeTree** – keeps high-cardinality roll-ups
-    (`mv_org_signatures`, `mv_org_roots`, `mv_org_tech`)
-    at **O(distinct-key)** storage.
-
-✓  **Dictionaries (FLAT / HASHED)** – sub-millisecond look-ups used:
-    • write-time CT heuristics (`tech_patterns` + `dict_tech_patterns`)
-    • read-time API (`dict_org_autocomplete`, `dict_org_roots`).
-
-✓  **Signal scalability** – `tech_signals` is insert-only; background
-    merges downsize parts.  Disk growth ≈ evidence volume.
-    Overwrite-free design avoids write amplification.
++ Append-only ingest path – partitions by lts; no in-flight duplicates.
++ Surrogate org_id (UInt64) – all joins/group-bys via hash key.
++ Large “wide” parts – minimizes background merges and write amplification.
++ Bloom / tokenbf / ngrambf – efficient substring filters on org/dn/issuer.
++ PSL helpers – registrable, root fields use built-in PSL.
++ AggregatingMergeTree rollups – constant size w.r.t. distinct-key.
++ FLAT/HASHED dictionaries – sub-ms lookups for heuristics and API.
++ Signal scalability – tech_signals is append-only, disk grows ~=~ evidence volume.
 
 ________________________________________________________________________
 EXTENSION HOOKS
 ________________________________________________________________________
 
-•  Add new heuristic pattern:  `INSERT INTO tech_patterns …`
-     then `SYSTEM RELOAD DICTIONARY dict_tech_patterns;`
+* Add new heuristic pattern:
+INSERT INTO tech_patterns …;
+SYSTEM RELOAD DICTIONARY dict_tech_patterns;
 
-•  Add new signal source:
-     `INSERT INTO tech_signals FORMAT JSONEachRow …`
+* Add new signal source:
+INSERT INTO tech_signals FORMAT JSONEachRow …;
 
-•  Adjust fuzzy match tolerance:
-     change `hammingDistance()` threshold in analyst queries.
-
-•  Suppress a false positive:
-
+* Suppress a false positive:
 INSERT INTO tech_signals VALUES
-('2025-07-01 12:00:00', 'acme co', 'acme.com',
-'WordPress', 0 /*confidence*/, 'active_scan',
-[('note','manual suppression')], 1 /*is_negative*/);
+('2025-07-01 12:00:00', org_id('acme co'), 'acme.com',
+'WordPress', 0, 'active_scan', [('note','manual suppression')], 1);
 
-•  Bump or rollback a detection pattern:
-
+* Bump or rollback a detection pattern:
 UPDATE tech_patterns SET weight = 0.4, version = version+1
 WHERE pattern = 'bitbucket';
 SYSTEM RELOAD DICTIONARY dict_tech_patterns;
 
-•  TTL to cold storage:
-
--- keep raw certs 24 months on fast disk, then move to 'blob' volume
+* TTL to cold storage:
 ALTER TABLE ct_certificates
-    MODIFY TTL lts + INTERVAL 24 MONTH TO VOLUME 'blob';
+MODIFY TTL lts + INTERVAL 24 MONTH TO VOLUME 'blob';
+   ALTER TABLE tech_signals
+     MODIFY TTL ts + INTERVAL 18 MONTH TO VOLUME 'blob';
 
--- keep tech evidence 18 months hot
-ALTER TABLE tech_signals
-    MODIFY TTL ts  + INTERVAL 18 MONTH TO VOLUME 'blob';
+* Manual/forced view refresh:
+SYSTEM REFRESH VIEW org_root_sets_mv;
 
+* Check view refresh status:
+SELECT * FROM system.view_refreshes WHERE view_name LIKE '%org%';
+
+* Debug/override:
+Force a refresh and inspect downstream tables after any batch.
 ________________________________________________________________________
 OPERATIONAL METRICS & OBSERVABILITY
 ________________________________________________________________________
 
 ==== etl_ingest_metrics ====
 
-Tracks every ETL/ingest run—useful for audit, debugging, and monitoring pipeline health.
+Tracks every ETL/ingest run for audit, debugging, and monitoring pipeline health.
 Records when, what, and how much data was loaded, plus run time and errors.
 
 Typical Insert (after ETL job):
@@ -220,8 +254,7 @@ ORDER BY ts DESC;
 ==== mv_partition_stats ====
 
 Live summary of active rows and bytes for each table/partition.
-Helps monitor storage usage and data growth; spot partitions that are too large, empty, or not merging/TTL-ing as expected.
-Investigate large partitions or partitions not shrinking after TTL.
+Monitor storage, spot partitions that are too large, empty, or not merging as expected.
 
 Example Queries
 
@@ -237,7 +270,9 @@ ORDER BY bytes DESC
 LIMIT 10;
 
 ==== system tables ====
-Investigate merge/TTL issues or stuck parts directly from ClickHouse.
+
+Monitor merges, mutations, TTL progress:
+system.merges, system.ttl_moves, system.view_refreshes, etc.
 
 Monitor merges, mutations, TTL progress:
 SELECT table, partition_id, progress, is_mutation, elapsed
@@ -248,6 +283,7 @@ Check ongoing TTL moves:
 SELECT * FROM system.ttl_moves WHERE table = 'ct_certificates';
 
 ==== slow_queries ====
+
 Use for long-running query analysis and troubleshooting.
 
 SELECT *
@@ -255,6 +291,14 @@ FROM slow_queries
 WHERE query_duration_ms > 10000
 ORDER BY event_time DESC
 LIMIT 10;
+
+________________________________________________________________________
+SCHEMA MAINTENANCE / WRITING
+________________________________________________________________________
+
+* Do NOT manually write to org_root_sets, org_alias_map, or org_autocomplete_clustered; these are maintained by periodic refreshable MVs.
+* Use SYSTEM REFRESH VIEW  to trigger immediate refresh if required.
+* All TTLs and refresh intervals are defined in DDL and can be tuned via ALTER TABLE.
 
 -----------------------------------------------------------------------*/
 
@@ -268,8 +312,11 @@ DROP FUNCTION IF EXISTS org_id;
 CREATE FUNCTION norm_token_key AS
   (s) -> arrayStringConcat(
            arraySort(
-             arrayDistinct(
-               splitByRegexp('[^\\p{L}\\p{N}]+', lowerUTF8(s))
+             arrayFilter(
+               x -> NOT x IN ('inc','llc','co','corp','ltd','sa','gmbh','the','and','&','plc'),
+               arrayDistinct(
+                 splitByRegexp('[^\\p{L}\\p{N}]+', lowerUTF8(s))
+               )
              )
            ),
            ' '
@@ -361,6 +408,7 @@ CREATE TABLE dns_flat
     registrable  String,
     root         String,
     dn_tokens    Array(String),
+    dn_tokens_full Array(String),
 
     organization String,
     ou           String,
@@ -373,7 +421,9 @@ CREATE TABLE dns_flat
     lts          DateTime,
 
     /* token Bloom on scalar domains */
-    INDEX idx_dn_token dn TYPE tokenbf_v1(2048,3,0) GRANULARITY 4
+    INDEX idx_dn_token_scalar dn TYPE tokenbf_v1(2048,3,0) GRANULARITY 4, 
+    INDEX idx_dn_token_array  dn_tokens      TYPE tokenbf_v1(2048,3,0) GRANULARITY 4,
+    INDEX idx_dn_tokens_full dn_tokens_full TYPE tokenbf_v1(2048,3,0) GRANULARITY 4
 )
 ENGINE = ReplacingMergeTree(ver)
 PARTITION BY toYYYYMM(lts)
@@ -384,54 +434,21 @@ DROP VIEW IF EXISTS mv_dns_flat;
 CREATE MATERIALIZED VIEW mv_dns_flat
 TO dns_flat AS
 SELECT
-    lower(dns)                            AS dn,
-    cutToFirstSignificantSubdomain(dns)   AS registrable,
-    firstSignificantSubdomain(dns)        AS root,
-    splitByRegexp('[^\\p{L}\\p{N}]+', firstSignificantSubdomain(dns)) AS dn_tokens,
+    lower(arrayJoin(arrayDistinct(dns)))               AS dn,
+    cutToFirstSignificantSubdomain(dn)                 AS registrable,
+    firstSignificantSubdomain(dn)                      AS root,
+    splitByRegexp('[^\\p{L}\\p{N}]+', root)            AS dn_tokens,
+    splitByRegexp('[^\\p{L}\\p{N}]+', dn)              AS dn_tokens_full,
 
-    organization,
-    ou,
-    locality,
-    province,
-    country,
-    org_id(organization)                  AS org_id,
+    arrayJoin(org)                                     AS organization,
+    arrayElement(ou,  1)                               AS ou,
+    arrayElement(loc, 1)                               AS locality,
+    arrayElement(prv, 1)                               AS province,
+    arrayElement(co,  1)                               AS country,
+    org_id(organization)                               AS org_id,
 
-    nbf,
-    sn,
-    lts
-FROM (
-  SELECT
-    arrayJoin(arrayDistinct(dns)) AS dns,
-    arrayJoin(org) AS organization,
-    arrayJoin(ou)  AS ou,
-    arrayJoin(loc) AS locality,
-    arrayJoin(prv) AS province,
-    arrayJoin(co)  AS country,
-
-    nbf,
-    sn,
-    lts
-
-  FROM ct_certificates
-) AS deduped;
-
-INSERT INTO dns_flat
-SELECT
-    lower(dns),
-    cutToFirstSignificantSubdomain(dns),
-    firstSignificantSubdomain(dns),
-    splitByRegexp('[^\\p{L}\\p{N}]+', firstSignificantSubdomain(dns)),
-    arrayJoin(org),
-    arrayJoin(ou),
-    arrayJoin(loc),
-    arrayJoin(prv),
-    arrayJoin(co),
-    org_id(arrayJoin(org)),
-    nbf,
-    sn,
-    lts
-FROM ct_certificates
-ARRAY JOIN dns AS dns;
+    nbf, sn, lts
+FROM ct_certificates;
 
 /*-----------------------------------------------------------------------
   3.  Org → certificate lookup view
@@ -449,7 +466,51 @@ SELECT
 FROM ct_certificates;
 
 /*-----------------------------------------------------------------------
-  4.  Organisation SipHash signatures (fuzzy backbone)
+  4.  Org → registrable-domain roll-up
+-----------------------------------------------------------------------*/
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_org_roots
+ENGINE = AggregatingMergeTree
+PARTITION BY toYYYYMM(toStartOfMonth(min_nbf))
+ORDER BY (norm_key, org_id)
+AS
+SELECT
+    norm_token_key(organization)   AS norm_key,
+    org_id(organization)           AS org_id,
+    groupUniqArray(registrable)    AS roots,
+    countDistinct(registrable)     AS root_cnt,
+    min(nbf) AS min_nbf
+FROM dns_flat
+GROUP BY norm_key, org_id;
+
+/* This table is automatically maintained by org_root_sets_mv.
+   Do not manually write to this table, it will refresh on a schedule. */
+CREATE OR REPLACE TABLE org_root_sets
+(
+    org_id    UInt64,
+    roots     Array(String),
+    root_cnt  UInt64
+)
+ENGINE = MergeTree
+ORDER BY org_id;
+
+DROP VIEW IF EXISTS org_root_sets_mv;
+
+CREATE MATERIALIZED VIEW org_root_sets_mv
+REFRESH AFTER 1 HOUR OFFSET 30 MINUTE
+TO org_root_sets AS
+SELECT
+    org_id,
+    roots,
+    length(roots) AS root_cnt
+FROM (
+    SELECT *,
+        row_number() OVER (PARTITION BY org_id ORDER BY min_nbf DESC) AS rn
+    FROM mv_org_roots
+)
+WHERE rn = 1;
+
+/*-----------------------------------------------------------------------
+  5.  Organisation SipHash signatures + autocomplete (fuzzy backbone)
 -----------------------------------------------------------------------*/
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_org_signatures
 ENGINE = AggregatingMergeTree
@@ -466,33 +527,104 @@ SELECT
 FROM ct_certificates
 GROUP BY norm_key, org_id;
 
-/*-----------------------------------------------------------------------
-  5.  Org → registrable-domain roll-up
------------------------------------------------------------------------*/
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_org_roots
-ENGINE = AggregatingMergeTree
-PARTITION BY toYYYYMM(toStartOfMonth(min_nbf))
-ORDER BY norm_key
+CREATE TABLE org_strings
+(
+    org String,
+    org_id UInt64 MATERIALIZED sipHash64(
+                     arrayStringConcat(
+                         arraySort(
+                           arrayDistinct(
+                             splitByRegexp('[^\\p{L}\\p{N}]+', lowerUTF8(org))
+                           )), ' ')
+                   ),
+
+    INDEX idx_org_prefix (org) TYPE tokenbf_v1(2048, 3, 0) GRANULARITY 4,
+    INDEX idx_org_ngram (org) TYPE ngrambf_v1(3, 2048, 3, 0) GRANULARITY 4
+)
+ENGINE = MergeTree
+ORDER BY org 
+SETTINGS index_granularity = 8192;
+
+DROP VIEW IF EXISTS mv_org_strings;
+CREATE MATERIALIZED VIEW mv_org_strings
+TO org_strings
 AS
+SELECT DISTINCT arrayJoin(org) AS org
+FROM ct_certificates;
+
+/* This table is automatically maintained by org_alias_map_mv.
+   Do not manually write to this table, it will refresh on a schedule. */
+CREATE OR REPLACE TABLE org_alias_map
+ENGINE = MergeTree
+ORDER BY (alias_id, canonical_id) AS
 SELECT
-    norm_token_key(organization)   AS norm_key,
-    groupUniqArray(registrable)    AS roots,
-    countDistinct(registrable)     AS root_cnt,
-    min(nbf) AS min_nbf
-FROM mv_dns_flat
-GROUP BY norm_key;
+    a.org_id                                  AS alias_id,
+    b.org_id                                  AS canonical_id,
+    arrayIntersect(a.roots, b.roots)          AS shared,
+    length(shared)                            AS inter_cnt,
+    length(arrayUnion(a.roots, b.roots))      AS uni_cnt
+FROM org_root_sets a
+JOIN org_root_sets b ON a.org_id < b.org_id
+WHERE length(arrayIntersect(a.roots, b.roots)) >= 2;
+
+CREATE MATERIALIZED VIEW org_alias_map_mv
+REFRESH AFTER 1 HOUR OFFSET 10 MINUTE
+TO org_alias_map AS
+SELECT
+    a.org_id                                  AS alias_id,
+    b.org_id                                  AS canonical_id,
+    arrayIntersect(a.roots, b.roots)          AS shared,
+    length(shared)                            AS inter_cnt,
+    length(arrayUnion(a.roots, b.roots))      AS uni_cnt
+FROM org_root_sets a
+JOIN org_root_sets b ON a.org_id < b.org_id
+WHERE length(shared) >= 2;
+
+/* This table is automatically maintained by org_autocomplete_clustered_mv.
+   Do not manually write to this table, it will refresh on a schedule. */
+CREATE TABLE org_autocomplete_clustered
+(
+    cluster_id   UInt64,
+    display_name String,
+    cert_count   UInt64,
+    aliases      Array(String),
+
+    INDEX idx_display_name_tokenbf (display_name) TYPE tokenbf_v1(2048, 3, 0) GRANULARITY 4,
+    INDEX idx_display_name_ngram   (display_name) TYPE ngrambf_v1(3, 2048, 3, 0) GRANULARITY 4,
+    INDEX idx_aliases_tokenbf      (aliases)      TYPE tokenbf_v1(2048, 3, 0) GRANULARITY 4,
+    INDEX idx_aliases_ngram        (aliases)      TYPE ngrambf_v1(3, 2048, 3, 0) GRANULARITY 4
+)
+ENGINE = MergeTree
+ORDER BY (cert_count DESC, display_name)
+SETTINGS index_granularity = 8192, allow_experimental_reverse_key = 1;
+
+CREATE MATERIALIZED VIEW org_autocomplete_clustered_mv
+REFRESH EVERY 1 HOUR OFFSET 50 MINUTE
+TO org_autocomplete_clustered AS
+SELECT
+    if(m.canonical_id != 0, m.canonical_id, c.org_id) AS cluster_id,
+    groupArrayDistinct(c.organization) AS aliases,
+    arrayElement(
+        groupArray((c.count, c.organization)),
+        argMax(c.count, c.organization)
+    ).2 AS display_name,
+    sum(c.count) AS cert_count
+FROM (
+    SELECT
+        org_id(arrayJoin(org)) AS org_id,
+        arrayJoin(org)         AS organization,
+        count()                AS count
+    FROM ct_certificates
+    WHERE arrayJoin(org) != ''
+    GROUP BY org_id, organization
+) AS c
+LEFT JOIN org_alias_map m ON c.org_id = m.alias_id
+GROUP BY cluster_id
+ORDER BY cert_count DESC;
 
 /*-----------------------------------------------------------------------
   6.  Low-latency dictionaries
 -----------------------------------------------------------------------*/
-CREATE DICTIONARY IF NOT EXISTS dict_org_autocomplete
-(
-    org String
-)
-PRIMARY KEY org
-SOURCE(CLICKHOUSE(code 'SELECT DISTINCT organization FROM mv_dns_flat'))
-LAYOUT(FLAT())
-LIFETIME(MIN 300 MAX 3600);
 
 CREATE DICTIONARY IF NOT EXISTS dict_org_roots
 (
@@ -509,16 +641,20 @@ LIFETIME(MIN 300 MAX 3600);
 -----------------------------------------------------------------------*/
 
 /* 7.1  Pattern dictionary (tiny, hand-editable) */
-CREATE TABLE IF NOT EXISTS tech_patterns
+CREATE TABLE tech_patterns
 (
-    id       UInt32,
-    pattern  String,
-    is_regex UInt8  DEFAULT 0,
-    tech     String,
-    weight   Float32 DEFAULT 1.0,
-    updated_at DateTime DEFAULT now(),
-    version UInt32 DEFAULT 1
-) ENGINE = TinyLog;
+    id            UInt32,
+    pattern       String,
+    is_regex      UInt8  DEFAULT 0,
+    regex_prefix  String DEFAULT '',
+    tech          String,
+    weight        Float32 DEFAULT 1.0,
+    updated_at    DateTime DEFAULT now(),
+    version       UInt32  DEFAULT 1
+)
+ENGINE = MergeTree
+PRIMARY KEY id
+ORDER BY id; 
 
 DROP DICTIONARY IF EXISTS dict_tech_patterns;
 
@@ -527,6 +663,7 @@ CREATE DICTIONARY dict_tech_patterns
     id       UInt32,
     pattern  String,
     is_regex UInt8,
+    regex_prefix String,
     tech     String,
     weight   Float32
 )
@@ -535,12 +672,40 @@ SOURCE(CLICKHOUSE(TABLE 'tech_patterns'))
 LAYOUT(HASHED())
 LIFETIME(MIN 300 MAX 3600);
 
-/* 7.2  Raw signal sink (external scanners + CT heuristics) 
+DROP DICTIONARY IF EXISTS dict_regex_prefixes;
+CREATE DICTIONARY dict_regex_prefixes
+(
+    regex_prefix String,
+    pattern      String,
+    tech         String,
+    weight       Float32
+)
+PRIMARY KEY regex_prefix, pattern
+SOURCE(
+    CLICKHOUSE(
+        QUERY '
+            SELECT regex_prefix, pattern, tech, weight
+            FROM tech_patterns
+            WHERE is_regex = 1
+        '
+    )
+)
+LAYOUT(COMPLEX_KEY_HASHED())
+LIFETIME(MIN 300 MAX 3600);
 
-Rules:  
-- positive wins if confidence higher and is_negative=0;  
-- suppression row (is_negative=1) sets confidence to 0 in mv_org_tech because maxState ignores it—switch to argMaxState(confidence, not is_negative) if you want negatives to overwrite.
-*/
+
+CREATE MATERIALIZED VIEW tech_tokens
+ENGINE = TinyLog
+AS
+SELECT id,
+       arrayJoin(
+           arrayFilter(x -> x != '',
+                       splitByNonAlpha(lower(pattern)))
+       ) AS token
+FROM tech_patterns
+WHERE is_regex = 0;
+
+/* 7.2  Raw signal sink (external scanners + CT heuristics) */
 
 CREATE TABLE IF NOT EXISTS tech_signals
 (
@@ -571,38 +736,55 @@ CREATE MATERIALIZED VIEW mv_ct_tech_signals_token
 TO tech_signals AS
 SELECT
     now64()                       AS ts,
-    org_id                        AS org_id,
-    registrable                   AS registrable,
+    df.org_id                     AS org_id,
+    df.registrable                AS registrable,
     tp.tech                       AS tech,
     tp.weight                     AS confidence,
     'ct_heuristic'                AS source,
-    [ tuple('dns', dn) ]          AS evidence,
+    [tuple('dns', df.dn)]         AS evidence,
     0                             AS is_negative
-FROM mv_dns_flat
-ANY INNER JOIN dict_tech_patterns AS tp
-     ON tp.is_regex = 0
-WHERE positionCaseInsensitive(dn, tp.pattern) > 0;
+FROM dns_flat AS df
+CROSS JOIN
+(
+    SELECT pattern, tech, weight
+    FROM dict_tech_patterns
+    WHERE is_regex = 0
+) AS tp
+WHERE arrayExists(
+          tok -> arrayExists(
+                     pat -> positionCaseInsensitive(tok, pat) > 0,
+                     (SELECT groupArray(token) FROM tech_tokens)),
+          df.dn_tokens_full)
+  AND positionCaseInsensitive(df.dn, tp.pattern) > 0;
+
 
 -- regex matches
 DROP VIEW IF EXISTS mv_ct_tech_signals_regex;
 CREATE MATERIALIZED VIEW mv_ct_tech_signals_regex
 TO tech_signals AS
 SELECT
-    now64()                  AS ts,
-    org_id                   AS org_id,
-    registrable              AS registrable,
-    tp.tech                  AS tech,
-    tp.weight                AS confidence,
-    'ct_heuristic'           AS source,
-    [tuple('dns', dn)]       AS evidence,
-    0                        AS is_negative
-FROM mv_dns_flat
-ANY INNER JOIN dict_tech_patterns AS tp
-  ON tp.is_regex = 1
-WHERE match(dn, tp.pattern);
+    now64()                 AS ts,
+    df.org_id               AS org_id,
+    df.registrable          AS registrable,
+    rp.tech                 AS tech,
+    rp.weight               AS confidence,
+    'ct_heuristic'          AS source,
+    [tuple('dns', df.dn)]   AS evidence,
+    0                       AS is_negative
+FROM dns_flat AS df
+CROSS JOIN
+(
+    SELECT regex_prefix, pattern, tech, weight
+    FROM dict_regex_prefixes
+) AS rp
+WHERE (rp.regex_prefix = ''
+       OR positionCaseInsensitive(df.dn, rp.regex_prefix) > 0)
+  AND match(df.dn, rp.pattern);
+
 
 /* 7.4  Aggregated truth table  (org × tech) */
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_org_tech
+DROP VIEW IF EXISTS mv_org_tech;
+CREATE MATERIALIZED VIEW mv_org_tech
 ENGINE = AggregatingMergeTree
 PARTITION BY month
 ORDER BY (org_id, tech)
@@ -610,11 +792,11 @@ AS
 SELECT
     org_id,
     tech,
-    argMaxState(confidence, ts) AS conf_state,
+    argMaxState(confidence, (ts, not is_negative)) AS conf_state,
     maxState(ts)          AS last_seen_state,
-    toYYYYMM(ts)          AS month
+    anyHeavy(toYYYYMM(ts))    AS month
 FROM tech_signals
-GROUP BY org_id, tech, toYYYYMM(ts);
+GROUP BY org_id, tech;
 
 CREATE OR REPLACE VIEW org_tech_facts AS
 SELECT

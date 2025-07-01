@@ -36,4 +36,14 @@ FROM azureBlobStorage(
      'JSONEachRow',                                    -- format
      'zstd',                                           -- compression
      'cn String,sub String,iss String,sn String,em Array(String),ou Array(String),org Array(String),loc Array(String),prv Array(String),co Array(String),st Array(String),pc Array(String),dns Array(String),ips Array(String),uris Array(String),nbf String,naf String,log String,li UInt64,lts UInt64'
-);
+)
+SETTINGS
+    -- split the JSONL stream every ~64 k rows
+    max_block_size              = 65536,
+    max_insert_block_size       = 65536,
+    -- force ClickHouse to flush each block immediately
+    async_insert                = 0,
+    wait_for_async_insert       = 1,
+    -- (optional) parallel parsing:
+    input_format_parallel_parsing = 1
+;
