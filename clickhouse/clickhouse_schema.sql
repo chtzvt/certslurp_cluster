@@ -80,7 +80,7 @@ ________________________________________________________________________
  - Editable patterns and live-reload dictionaries for token/regex → tech mapping.
 
 10. tech_signals  (MergeTree)
- - All technology “signals” (from heuristics + external sources)
+ - All technology "signals" (from heuristics + external sources)
  - Evidence, source, confidence, is_negative fields
 
 11. mv_ct_tech_signals_token / mv_ct_tech_signals_regex
@@ -102,23 +102,23 @@ ________________________________________________________________________
 
 * What techs does Org X run?
 SELECT * FROM org_tech_facts
-WHERE org_id = org_id(‘acme inc’) AND confidence >= 0.5;
+WHERE org_id = org_id('acme inc') AND confidence >= 0.5;
 
 * Which orgs appear to run GitLab in DE + CH?
 SELECT any(one_example) AS org_sample, confidence
 FROM org_tech_facts
 ANY INNER JOIN mv_org_signatures USING (org_id)
-WHERE tech=‘GitLab’
+WHERE tech='GitLab'
 AND org_id IN (
 SELECT org_id FROM dns_flat
-WHERE country IN (‘DE’,‘CH’)
+WHERE country IN ('DE','CH')
 );
 
 * Growth of .bitbucket registrable domains in JP:
 SELECT toStartOfMonth(nbf) AS month,
 uniqExact(registrable) AS n
 FROM dns_flat
-WHERE country=‘JP’ AND dn ILIKE ‘%bitbucket%’
+WHERE country='JP' AND dn ILIKE '%bitbucket%'
 GROUP BY month ORDER BY month;
 
 * Recent ETL job runs and durations:
@@ -135,7 +135,7 @@ GROUP BY job_name, table_name;
 * Error summary for last 24h:
 SELECT ts, job_name, error
 FROM etl_ingest_metrics
-WHERE error != ‘’
+WHERE error != ''
 ORDER BY ts DESC;
 
 * Per-table partition sizes (latest):
@@ -155,7 +155,7 @@ FROM system.merges
 WHERE active = 1;
 
 * Check ongoing TTL moves:
-SELECT * FROM system.ttl_moves WHERE table = ‘ct_certificates’;
+SELECT * FROM system.ttl_moves WHERE table = 'ct_certificates';
 
 * Show long-running queries:
 SELECT * FROM slow_queries
@@ -168,13 +168,93 @@ SELECT * FROM org_autocomplete_clustered
 WHERE length(aliases) > 1
 ORDER BY cert_count DESC;
 
+
+* Fuzzy search for orgs containing "acme" (case-insensitive, matches aliases or display_name)
+SELECT
+    display_name,
+    aliases,
+    cert_count
+FROM org_autocomplete_clustered
+WHERE display_name ILIKE '%acme%'
+   OR arrayExists(x -> positionCaseInsensitive(x, 'acme') > 0, aliases)
+ORDER BY cert_count DESC
+LIMIT 10;
+
+* Find orgs running "GitLab" with confidence at least 0.5, showing sample alias
+SELECT
+    o.display_name,
+    o.aliases,
+    f.confidence,
+    f.last_seen
+FROM org_tech_facts AS f
+JOIN org_autocomplete_clustered AS o ON f.org_id = o.cluster_id
+WHERE f.tech = 'GitLab' AND f.confidence >= 0.5
+ORDER BY f.confidence DESC, f.last_seen DESC
+LIMIT 25;
+
+* All tech detected for orgs matching 'acme'
+SELECT
+    f.tech,
+    f.confidence,
+    f.last_seen
+FROM org_tech_facts AS f
+JOIN org_autocomplete_clustered AS o ON f.org_id = o.cluster_id
+WHERE arrayExists(x -> positionCaseInsensitive(x, 'acme') > 0, o.aliases)
+ORDER BY f.confidence DESC, f.tech
+
+* Orgs in Germany ("DE") or Switzerland ("CH") using GitLab
+SELECT
+    o.display_name,
+    o.aliases,
+    f.confidence,
+    f.last_seen
+FROM org_tech_facts AS f
+JOIN org_autocomplete_clustered AS o ON f.org_id = o.cluster_id
+WHERE f.tech = 'GitLab'
+  AND f.confidence >= 0.5
+  AND f.org_id IN (
+      SELECT org_id FROM dns_flat
+      WHERE country IN ('DE', 'CH')
+  )
+ORDER BY f.last_seen DESC;
+
+* Tech detected for a particular SAN (e.g., "example.com")
+SELECT
+    t.tech,
+    t.confidence,
+    t.last_seen
+FROM org_tech_facts t
+JOIN dns_flat d ON t.org_id = d.org_id
+WHERE d.dn = 'example.com'
+ORDER BY t.confidence DESC, t.tech
+
+* Given a user-typed org name, get cluster and all known aliases
+SELECT
+    cluster_id,
+    display_name,
+    aliases
+FROM org_autocomplete_clustered
+WHERE arrayExists(x -> positionCaseInsensitive(x, 'jpmorgan') > 0, aliases)
+   OR display_name ILIKE '%jpmorgan%';
+
+
+* Find all facts and aliases for a known org_id
+SELECT
+    f.tech,
+    f.confidence,
+    f.last_seen,
+    o.display_name,
+    o.aliases
+FROM org_tech_facts f
+JOIN org_autocomplete_clustered o ON f.org_id = o.cluster_id
+WHERE f.org_id = org_id('Acme Inc');
 ________________________________________________________________________
 PERFORMANCE CONSIDERATIONS
 ________________________________________________________________________
 
 + Append-only ingest path – partitions by lts; no in-flight duplicates.
 + Surrogate org_id (UInt64) – all joins/group-bys via hash key.
-+ Large “wide” parts – minimizes background merges and write amplification.
++ Large "wide" parts – minimizes background merges and write amplification.
 + Bloom / tokenbf / ngrambf – efficient substring filters on org/dn/issuer.
 + PSL helpers – registrable, root fields use built-in PSL.
 + AggregatingMergeTree rollups – constant size w.r.t. distinct-key.
@@ -496,7 +576,7 @@ ORDER BY org_id;
 DROP VIEW IF EXISTS org_root_sets_mv;
 
 CREATE MATERIALIZED VIEW org_root_sets_mv
-REFRESH AFTER 1 HOUR OFFSET 30 MINUTE
+REFRESH EVERY 1 DAY OFFSET 1 HOUR RANDOMIZE FOR 1 HOUR
 TO org_root_sets AS
 SELECT
     org_id,
@@ -568,7 +648,7 @@ JOIN org_root_sets b ON a.org_id < b.org_id
 WHERE length(arrayIntersect(a.roots, b.roots)) >= 2;
 
 CREATE MATERIALIZED VIEW org_alias_map_mv
-REFRESH AFTER 1 HOUR OFFSET 10 MINUTE
+REFRESH EVERY 1 DAY OFFSET 3 HOUR RANDOMIZE FOR 1 HOUR
 TO org_alias_map AS
 SELECT
     a.org_id                                  AS alias_id,
@@ -792,9 +872,10 @@ AS
 SELECT
     org_id,
     tech,
-    argMaxState(confidence, (ts, not is_negative)) AS conf_state,
-    maxState(ts)          AS last_seen_state,
-    anyHeavy(toYYYYMM(ts))    AS month
+    maxState(confidence) AS conf_state,
+    maxState(ts)         AS last_seen_state,
+    anyHeavy(toYYYYMM(ts)) AS month,
+    maxState(is_negative) AS suppression_state
 FROM tech_signals
 GROUP BY org_id, tech;
 
@@ -802,8 +883,9 @@ CREATE OR REPLACE VIEW org_tech_facts AS
 SELECT
     org_id,
     tech,
-    finalizeAggregation(conf_state)              AS confidence,
-    toDateTime64(finalizeAggregation(last_seen_state),3) AS last_seen
+    -- If suppression_state==1, force confidence to zero
+    IF(finalizeAggregation(suppression_state)=1, 0, finalizeAggregation(conf_state)) AS confidence,
+    toDateTime64(finalizeAggregation(last_seen_state), 3) AS last_seen
 FROM mv_org_tech;
 
 /*-----------------------------------------------------------------------
