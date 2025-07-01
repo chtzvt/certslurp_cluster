@@ -288,7 +288,7 @@ CREATE TABLE IF NOT EXISTS ct_certificates
     cn  String,
     sub String,
     iss String,
-    sn  FixedString(32),
+    sn  String,
 
     /* multi-value RDN / SAN fields */
     em   Array(String),
@@ -329,6 +329,7 @@ ALTER TABLE ct_certificates
     MODIFY COLUMN cn   String         CODEC(ZSTD(3)),
     MODIFY COLUMN sub  String         CODEC(ZSTD(3)),
     MODIFY COLUMN iss  String         CODEC(ZSTD(3)),
+    MODIFY COLUMN sn  String         CODEC(ZSTD(3)),
 
     -- multi-value arrays -> keep existing type, add codec
     MODIFY COLUMN dns  Array(String)  CODEC(ZSTD(3)),
