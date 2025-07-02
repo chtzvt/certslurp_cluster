@@ -102,25 +102,108 @@ ________________________________________________________________________
 
 * What techs does Org X run?
 SELECT * FROM org_tech_facts
-WHERE org_id = org_id('acme inc') AND confidence >= 0.5;
+WHERE org_id = org_id('JPMorgan Chase') AND confidence >= 0.5;
+
+* Specific source signals that led to a given tech detection at an org:
+SELECT
+    tech,
+    confidence,
+    source,
+    ts,
+    evidence
+FROM tech_signals
+WHERE org_id = org_id('JPMorgan Chase')
+  AND tech = 'GitLab'
+  AND confidence >= 0.5
+ORDER BY ts DESC
+LIMIT 50;
+
+* All tech signals + evidence for a given organization:
+SELECT
+    tech,
+    confidence,
+    source,
+    ts,
+    evidence
+FROM tech_signals
+WHERE org_id = org_id('JPMorgan Chase')
+  AND confidence >= 0.5
+ORDER BY tech, ts DESC
+LIMIT 200;
+
+Grouped by tech:
+
+SELECT
+    t.tech,
+    arrayJoin(t.evidence) AS evidence_detail,
+    t.confidence,
+    t.ts
+FROM tech_signals AS t
+WHERE t.org_id = org_id('JPMorgan Chase')
+  AND t.confidence >= 0.5
+ORDER BY t.tech, t.ts DESC
+LIMIT 200
+
+As a single array:
+
+SELECT
+    t.tech,
+    groupArray((t.ts, t.evidence, t.source)) AS all_evidence,
+    max(t.confidence) as max_confidence
+FROM tech_signals AS t
+WHERE t.org_id = org_id('JPMorgan Chase')
+  AND t.confidence >= 0.5
+GROUP BY t.tech
+ORDER BY t.tech
+
+* Correlated with certificates:
+
+SELECT
+    t.tech,
+    t.confidence,
+    t.source,
+    t.ts,
+    t.evidence,
+    d.dn,
+    d.organization,
+    d.sn,
+    d.lts,
+    d.nbf
+FROM tech_signals AS t
+LEFT JOIN dns_flat AS d ON (d.dn = ((arrayFilter(x -> ((x.1) = 'dns'), t.evidence)[1]).2)) AND (d.org_id = t.org_id)
+WHERE (t.org_id = org_id('JPMorgan Chase')) AND (t.confidence >= 0.5)
+ORDER BY t.ts DESC
+LIMIT 100
+
+* Fetch the most recent cert for a particular detection:
+
+SELECT *
+FROM dns_flat
+WHERE dn = 'githubcopilot-prod-106135.jpmchase.com'
+  AND org_id = org_id('JPMorgan Chase')
+ORDER BY ts DESC
+LIMIT 1
 
 * Which orgs appear to run GitLab in DE + CH?
 SELECT
     o.display_name,
-    f.confidence
-FROM org_tech_facts f
-JOIN org_autocomplete_clustered o ON f.org_id = o.cluster_id
-WHERE f.tech = 'GitLab'
-  AND f.org_id IN (
-      SELECT org_id FROM dns_flat WHERE country IN ('DE','CH')
-  )
-ORDER BY f.confidence DESC;
+    f.confidence,
+    f.last_seen
+FROM org_tech_facts AS f
+INNER JOIN org_autocomplete_clustered AS o ON f.org_id = o.cluster_id
+WHERE (f.tech = 'GitLab') AND (f.confidence >= 0.5) AND (f.org_id IN (
+    SELECT org_id
+    FROM dns_flat
+    WHERE country IN ('DE', 'CH')
+))
+ORDER BY f.last_seen DESC
+LIMIT 50;
 
-* Growth of .bitbucket registrable domains in JP:
+* Growth of .bitbucket registrable domains in DE:
 SELECT toStartOfMonth(nbf) AS month,
 uniqExact(registrable) AS n
 FROM dns_flat
-WHERE country='JP' AND dn ILIKE '%bitbucket%'
+WHERE country='DE' AND dn ILIKE '%bitbucket%'
 GROUP BY month ORDER BY month;
 
 * Recent ETL job runs and durations:
@@ -174,7 +257,6 @@ ORDER BY cert_count DESC;
 * Fuzzy search for orgs containing "acme" (case-insensitive, matches aliases or display_name)
 SELECT
     display_name,
-    aliases,
     cert_count
 FROM org_autocomplete_clustered
 WHERE display_name ILIKE '%acme%'
@@ -185,7 +267,6 @@ LIMIT 10;
 * Find orgs running "GitLab" with confidence at least 0.5, showing sample alias
 SELECT
     o.display_name,
-    o.aliases,
     f.confidence,
     f.last_seen
 FROM org_tech_facts AS f
@@ -204,22 +285,6 @@ JOIN org_autocomplete_clustered AS o ON f.org_id = o.cluster_id
 WHERE arrayExists(x -> positionCaseInsensitive(x, 'acme') > 0, o.aliases)
 ORDER BY f.confidence DESC, f.tech
 
-* Orgs in Germany ("DE") or Switzerland ("CH") using GitLab
-SELECT
-    o.display_name,
-    o.aliases,
-    f.confidence,
-    f.last_seen
-FROM org_tech_facts AS f
-JOIN org_autocomplete_clustered AS o ON f.org_id = o.cluster_id
-WHERE f.tech = 'GitLab'
-  AND f.confidence >= 0.5
-  AND f.org_id IN (
-      SELECT org_id FROM dns_flat
-      WHERE country IN ('DE', 'CH')
-  )
-ORDER BY f.last_seen DESC;
-
 * Tech detected for a particular SAN (e.g., "example.com")
 SELECT
     t.tech,
@@ -233,8 +298,7 @@ ORDER BY t.confidence DESC, t.tech
 * Given a user-typed org name, get cluster and all known aliases
 SELECT
     cluster_id,
-    display_name,
-    aliases
+    display_name
 FROM org_autocomplete_clustered
 WHERE arrayExists(x -> positionCaseInsensitive(x, 'jpmorgan') > 0, aliases)
    OR display_name ILIKE '%jpmorgan%';
@@ -245,8 +309,7 @@ SELECT
     f.tech,
     f.confidence,
     f.last_seen,
-    o.display_name,
-    o.aliases
+    o.display_name
 FROM org_tech_facts f
 JOIN org_autocomplete_clustered o ON f.org_id = o.cluster_id
 WHERE f.org_id = org_id('Acme Inc');
@@ -775,7 +838,7 @@ FROM (
 WHERE rn = 1;
 
 /*-----------------------------------------------------------------------
-  5.  Organisation SipHash signatures + autocomplete (fuzzy backbone)
+  5.  Organization SipHash signatures + autocomplete (fuzzy backbone)
 -----------------------------------------------------------------------*/
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_org_signatures
 ENGINE = AggregatingMergeTree
@@ -867,10 +930,7 @@ TO org_autocomplete_clustered AS
 SELECT
     if(m.canonical_id != 0, m.canonical_id, c.org_id) AS cluster_id,
     groupArrayDistinct(c.organization) AS aliases,
-    arrayElement(
-        groupArray((c.count, c.organization)),
-        argMax(c.count, c.organization)
-    ).2 AS display_name,
+    canonical_org_name(groupArrayDistinct(c.organization)) AS display_name,
     sum(c.count) AS cert_count
 FROM (
     SELECT
