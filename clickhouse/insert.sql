@@ -41,6 +41,7 @@ SETTINGS
     -- split the JSONL stream every ~64 k rows
     max_block_size              = 65536,
     max_insert_block_size       = 65536,
+    max_partitions_per_insert_block = 512,
     -- force ClickHouse to flush each block immediately
     async_insert                = 0,
     wait_for_async_insert       = 1,
