@@ -414,10 +414,14 @@ CREATE OR REPLACE FUNCTION norm_token_key AS
                x -> length(x) > 1 AND NOT x IN ('inc','incorporated','llc','co','company','corp','corporation','ltd','limited','sa','gmbh','the','and','&','-','of',
                'pvt','llp','bv','spa','as','oy','aps','ab','sarl','nv','ag','sl','sas','kg','kgaa','pte','plc','ltda','sl','pty','srl','at','for',
                'gesellschaft','societe','société','empresa','firma','compania','compañía','compañia','associés','vereniging'),
-               arrayDistinct(
-                 arrayMap(
-                   t -> replaceRegexpAll(t, '[^\\p{L}\\p{N}]', ''),
-                   splitByRegexp('[^\\p{L}\\p{N}]+', lowerUTF8(s))
+                arrayDistinct(
+                 splitByChar(
+                   ' ',
+                   replaceRegexpAll(
+                     lowerUTF8(s),
+                     '[^\\p{L}\\p{N}\\s]+',  -- only spaces are preserved, all else removed before tokenization step
+                     ''
+                   )
                  )
                )
              )
