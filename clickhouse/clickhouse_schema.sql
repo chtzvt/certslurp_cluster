@@ -391,13 +391,34 @@ DROP FUNCTION IF EXISTS norm_token_key;
 DROP FUNCTION IF EXISTS org_id;
 
 -- 1️⃣ token-normalisation helper
-CREATE FUNCTION norm_token_key AS
+
+/* Stopword list can be tuned with results from:
+
+SELECT
+    token,
+    count() AS n
+FROM
+(
+    SELECT arrayDistinct(splitByChar(' ', norm_token_key(org))) AS tokens
+    FROM org_strings
+)
+ARRAY JOIN tokens AS token
+GROUP BY token
+ORDER BY n DESC
+LIMIT 50
+*/
+CREATE OR REPLACE FUNCTION norm_token_key AS
   (s) -> arrayStringConcat(
            arraySort(
              arrayFilter(
-               x -> NOT x IN ('inc','llc','co','corp','ltd','sa','gmbh','the','and','&','plc'),
+               x -> length(x) > 1 AND NOT x IN ('inc','incorporated','llc','co','company','corp','corporation','ltd','limited','sa','gmbh','the','and','&','-','of',
+               'pvt','llp','bv','spa','as','oy','aps','ab','sarl','nv','ag','sl','sas','kg','kgaa','pte','plc','ltda','sl','pty','srl','at','for',
+               'gesellschaft','societe','société','empresa','firma','compania','compañía','compañia','associés','vereniging'),
                arrayDistinct(
-                 splitByRegexp('[^\\p{L}\\p{N}]+', lowerUTF8(s))
+                 arrayMap(
+                   t -> replaceRegexpAll(t, '[^\\p{L}\\p{N}]', ''),
+                   splitByRegexp('[^\\p{L}\\p{N}]+', lowerUTF8(s))
+                 )
                )
              )
            ),
@@ -537,14 +558,16 @@ FROM ct_certificates;
 -----------------------------------------------------------------------*/
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_org_cert
 ENGINE = MergeTree
-PARTITION BY toYYYYMM(nbf)
+PARTITION BY toYYYYMM(lts)
 ORDER BY (organization, sn)
 AS
 SELECT
     arrayJoin(org) AS organization,
     org_id(organization) AS org_id,
     sn,
-    nbf
+    nbf,
+    naf, 
+    lts
 FROM ct_certificates;
 
 /*-----------------------------------------------------------------------
@@ -552,7 +575,7 @@ FROM ct_certificates;
 -----------------------------------------------------------------------*/
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_org_roots
 ENGINE = AggregatingMergeTree
-PARTITION BY toYYYYMM(toStartOfMonth(min_nbf))
+PARTITION BY toYYYYMM(min_lts)
 ORDER BY (norm_key, org_id)
 AS
 SELECT
@@ -560,7 +583,10 @@ SELECT
     org_id(organization)           AS org_id,
     groupUniqArray(registrable)    AS roots,
     countDistinct(registrable)     AS root_cnt,
-    min(nbf) AS min_nbf
+    min(nbf) AS min_nbf,
+    max(nbf) AS max_naf,
+    min(lts) AS min_lts,
+    max(lts) AS max_lts
 FROM dns_flat
 GROUP BY norm_key, org_id;
 
@@ -596,7 +622,7 @@ WHERE rn = 1;
 -----------------------------------------------------------------------*/
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_org_signatures
 ENGINE = AggregatingMergeTree
-PARTITION BY toYYYYMM(toStartOfMonth(min_nbf))
+PARTITION BY toYYYYMM(min_lts)
 ORDER BY norm_key
 AS
 SELECT
@@ -605,7 +631,10 @@ SELECT
     sipHash64(norm_key)                   AS sh64,
     anyHeavy(arrayJoin(org))              AS one_example,
     groupBitmapState(sipHash64(sn))       AS sn_bitmap,
-    min(nbf)                              AS min_nbf
+    min(nbf)                              AS min_nbf,
+    max(nbf)                              AS max_naf,
+    min(lts) AS min_lts,
+    max(lts) AS max_lts
 FROM ct_certificates
 GROUP BY norm_key, org_id;
 
