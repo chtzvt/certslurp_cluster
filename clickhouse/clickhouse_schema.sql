@@ -105,14 +105,16 @@ SELECT * FROM org_tech_facts
 WHERE org_id = org_id('acme inc') AND confidence >= 0.5;
 
 * Which orgs appear to run GitLab in DE + CH?
-SELECT any(one_example) AS org_sample, confidence
-FROM org_tech_facts
-ANY INNER JOIN mv_org_signatures USING (org_id)
-WHERE tech='GitLab'
-AND org_id IN (
-SELECT org_id FROM dns_flat
-WHERE country IN ('DE','CH')
-);
+SELECT
+    o.display_name,
+    f.confidence
+FROM org_tech_facts f
+JOIN org_autocomplete_clustered o ON f.org_id = o.cluster_id
+WHERE f.tech = 'GitLab'
+  AND f.org_id IN (
+      SELECT org_id FROM dns_flat WHERE country IN ('DE','CH')
+  )
+ORDER BY f.confidence DESC;
 
 * Growth of .bitbucket registrable domains in JP:
 SELECT toStartOfMonth(nbf) AS month,
