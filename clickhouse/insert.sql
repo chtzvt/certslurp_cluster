@@ -46,5 +46,8 @@ SETTINGS
     async_insert                = 0,
     wait_for_async_insert       = 1,
     -- (optional) parallel parsing:
-    input_format_parallel_parsing = 1
-;
+    input_format_parallel_parsing = 1;
+
+SYSTEM REFRESH VIEW org_root_sets_mv;
+SYSTEM REFRESH VIEW org_alias_map_mv;
+SYSTEM REFRESH VIEW org_autocomplete_clustered_mv;
