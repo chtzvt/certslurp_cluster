@@ -250,6 +250,33 @@ SELECT
 FROM org_tech_facts f
 JOIN org_autocomplete_clustered o ON f.org_id = o.cluster_id
 WHERE f.org_id = org_id('Acme Inc');
+
+* Autocomplete by organization name
+
+-- Position-independent 
+SELECT
+    org_id,
+    canonical_org_name(groupArray(org)) AS display_name
+FROM org_strings
+WHERE norm_token_key(org) ILIKE '%ven%'
+GROUP BY org_id
+ORDER BY
+    count() DESC,
+    display_name ASC
+LIMIT 10
+
+-- Only at start of search 
+SELECT
+    org_id,
+    canonical_org_name(groupArray(org)) AS display_name
+FROM org_strings
+WHERE org ILIKE 'Ven%'
+GROUP BY org_id
+ORDER BY
+    count() DESC,
+    display_name ASC
+LIMIT 10
+
 ________________________________________________________________________
 PERFORMANCE CONSIDERATIONS
 ________________________________________________________________________
@@ -389,10 +416,31 @@ ________________________________________________________________________
 -----------------------------------------------------------------------*/
 DROP FUNCTION IF EXISTS norm_token_key;
 DROP FUNCTION IF EXISTS org_id;
+DROP FUNCTION IF EXISTS canonical_org_name;
 
--- 1️⃣ token-normalisation helper
 
-/* Stopword list can be tuned with results from:
+/* norm_token_key
+
+Deterministically normalizes an organization (or entity) name string to a simple, fuzzy-matchable token key.
+
+* Enables Fuzzy/loose deduplication, grouping, or searching of organization names.
+* Used as the base for clustering or entity resolution.
+
+== How it Works
+* Converts to lowercase.
+* Removes all non-alphanumeric characters (except whitespace).
+* Splits into tokens on spaces.
+* Removes common organization stopwords (Inc, Ltd, LLC, etc.) and any tokens of length ≤ 1.
+* Deduplicates and sorts tokens.
+* Joins them back into a space-separated string.
+
+== Example
+
+SELECT norm_token_key('AT&T Services, Inc.')  -- Returns: 'att services'
+SELECT norm_token_key('Queen’s University of Belfast')  -- Returns: 'belfast queens university'
+
+
+Stopword list can be tuned with results from:
 
 SELECT
     token,
@@ -429,9 +477,114 @@ CREATE OR REPLACE FUNCTION norm_token_key AS
            ' '
          );
 
--- 2️⃣ deterministic organisation-ID hash
-CREATE FUNCTION org_id AS
+
+/* org_id
+
+Returns a deterministic 64-bit hash of an organization name for fast joins and clustering.
+Provides a stable, normalized org key for joins, groupings, and identity resolution across tables.
+
+How it works:
+* Calls norm_token_key on the input string.
+* Applies sipHash64 to produce a UInt64 ID.
+
+Example:
+
+SELECT org_id('AT&T Inc.')  -- Returns: 4058091255216720182  (example value)
+
+*/
+CREATE OR REPLACE FUNCTION org_id AS
   (s) -> sipHash64(norm_token_key(s));
+
+
+/* canonical_org_name 
+
+Select the best canonical display name from a set of possible organization name variants. Ideal for normalizing org names in certificate analytics, 
+entity resolution, autocomplete, or any use-case with many noisy string variants.
+
+* Underlying normalization is done with norm_token_key.
+* Designed to work well for company and organization names from certificate fields, directory listings, customer data, etc.
+* Can be adapted with different scoring rules for domain or internationalization needs.
+
+== Usage
+
+Typically used over a grouped array of org names, e.g.:
+
+SELECT
+    org_id,
+    arraySlice(groupArray(org), 1, 5) AS org_examples,
+    canonical_org_name(groupArray(org)) AS canonical
+FROM org_strings
+GROUP BY org_id
+ORDER BY count() DESC
+LIMIT 100
+
+Examples:
+
+SELECT canonical_org_name(['PepsiCo Inc', 'Pepsico, Inc', 'PEPSICO, INC', 'Pepsico Inc'])
+-- Returns 'Pepsico, Inc'
+
+SELECT canonical_org_name([
+    'NEC CORPORATION',
+    'NEC Corporation'
+])
+-- Returns 'NEC Corporation'
+
+SELECT canonical_org_name([
+    'AMERICAN INTERNATIONAL GROUP INC.',
+    'American International Group, Inc.'
+])
+-- Returns 'American International Group, Inc.'
+
+== How it Works
+
+Given an array of org name variants, canonical_org_name:
+
+1. Normalizes each name (using norm_token_key) to group together truly-similar names.
+2. Counts the frequency of each variant.
+3. Scores each variant based on:
+	* Preferred casing: Favors Title Case (e.g., Pepsico, Inc) over ALLCAPS or all lowercase.
+	* Penalizes ALLCAPS: (e.g., PEPSICO, INC).
+	* Frequency: Higher frequency is better.
+	* Similarity to the first variant: Jaccard string similarity to the normalized form of the first name in the list.
+	* Length: Slightly prefers longer names (to avoid over-aggressive abbreviation).
+4. Returns the original-cased string with the highest score.
+
+Scoring Algorithm (Heuristic)
+
+A score is computed for each name variant as follows:
+* +1000 points if the string is in Title Case (initcapUTF8).
+* −500 points if the string is ALL CAPS (upperUTF8).
+* +100 * frequency in the input array.
+* +100 * Jaccard similarity to the normalized form of the first variant.
+* +0.01 * string length (slight tie-breaker).
+
+The variant with the highest total score is returned.
+*/
+CREATE OR REPLACE FUNCTION canonical_org_name AS names ->
+    arrayFirst(
+        x -> x.2 != '',
+        arraySort(
+            x -> (
+                -1 * (
+                    (initcapUTF8(x.2) = x.2 ? 1000 : 0) - (upperUTF8(x.2) = x.2 ? 500 : 0)
+                    + x.3 * 100
+                    + stringJaccardIndex(x.1, x.4) * 100
+                    + length(x.2) * 0.01
+                ),
+                x.2
+            ),
+            arrayMap(
+                n -> (
+                    norm_token_key(n),
+                    n,
+                    countEqual(names, n),
+                    norm_token_key(names[1])
+                ),
+                arrayDistinct(names)
+            )
+        )
+    ).2
+;
 
 /*-----------------------------------------------------------------------
   1.  Raw certificate landing table
@@ -525,7 +678,7 @@ CREATE TABLE dns_flat
     org_id       UInt64,
     nbf          DateTime64(0, 'UTC'),
     sn           String,
-    lts          DateTime,
+    lts          DateTime64(6, 'UTC'),
 
     /* token Bloom on scalar domains */
     INDEX idx_dn_token_scalar dn TYPE tokenbf_v1(2048,3,0) GRANULARITY 4, 
@@ -645,13 +798,8 @@ GROUP BY norm_key, org_id;
 CREATE TABLE org_strings
 (
     org String,
-    org_id UInt64 MATERIALIZED sipHash64(
-                     arrayStringConcat(
-                         arraySort(
-                           arrayDistinct(
-                             splitByRegexp('[^\\p{L}\\p{N}]+', lowerUTF8(org))
-                           )), ' ')
-                   ),
+    org_id UInt64 MATERIALIZED org_id(org),
+
 
     INDEX idx_org_prefix (org) TYPE tokenbf_v1(2048, 3, 0) GRANULARITY 4,
     INDEX idx_org_ngram (org) TYPE ngrambf_v1(3, 2048, 3, 0) GRANULARITY 4
