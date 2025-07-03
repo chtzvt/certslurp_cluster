@@ -79,12 +79,15 @@ ________________________________________________________________________
 9. tech_patterns/dict_tech_patterns/dict_regex_prefixes
  - Editable patterns and live-reload dictionaries for token/regex → tech mapping.
 
-10. tech_signals  (MergeTree)
+10. tech_signals  (ReplacingMergeTree)
  - All technology "signals" (from heuristics + external sources)
  - Evidence, source, confidence, is_negative fields
+ - Very robust deduplication logic
+ - Continuously refreshed by mv_ct_tech_signals
 
-11. mv_ct_tech_signals_token / mv_ct_tech_signals_regex
+11. mv_ct_tech_signals
  - Insert tech_signals from token and regex matches in mv_dns_flat.
+ - Refreshes on schedule
 
 12. mv_org_tech / org_tech_facts (AggregatingMergeTree/view)
  - One row per (org_id, tech); highest-confidence, deduped
@@ -339,6 +342,41 @@ ORDER BY
     count() DESC,
     display_name ASC
 LIMIT 10
+
+________________________________________________________________________
+MANAGING DETECTIONS
+________________________________________________________________________
+
+== Adding a new detection
+
+Insert your detection rule/pattern: 
+
+-- regex rule (matching subdomains of ghe.com):
+INSERT INTO tech_patterns (id, pattern, is_regex, regex_prefix, tech, weight)
+VALUES (10, '^([a-z0-9-]+\\.)+ghe\\.com$', 1, 'ghe.com', 'GitHub Enterprise Cloud (Data Residency)', 1.0);
+
+Reload the dictionaries:
+
+SYSTEM RELOAD DICTIONARY dict_tech_patterns;
+SYSTEM RELOAD DICTIONARY dict_regex_prefixes;
+
+(Optional) Refresh mv_ct_tech_signals (if you want to apply the new detections to existing data immediately, otherwise it'll refresh automatically on schedule):
+
+SYSTEM REFRESH VIEW mv_ct_tech_signals;
+
+(Optional) Check for your detections:
+
+SELECT
+    ts,
+    org_id,
+    registrable,
+    evidence
+FROM tech_signals
+WHERE tech = 'GitHub Enterprise Cloud (Data Residency)'
+  AND source = 'ct_heuristic'
+  AND ts >= now() - INTERVAL 1 HOUR
+ORDER BY ts DESC
+LIMIT 100;
 
 ________________________________________________________________________
 PERFORMANCE CONSIDERATIONS
@@ -925,7 +963,7 @@ ORDER BY (cert_count DESC, display_name)
 SETTINGS index_granularity = 8192, allow_experimental_reverse_key = 1;
 
 CREATE MATERIALIZED VIEW org_autocomplete_clustered_mv
-REFRESH EVERY 1 HOUR OFFSET 50 MINUTE
+REFRESH EVERY 1 DAY OFFSET 50 MINUTE
 TO org_autocomplete_clustered AS
 SELECT
     if(m.canonical_id != 0, m.canonical_id, c.org_id) AS cluster_id,
@@ -1016,7 +1054,6 @@ SOURCE(
 LAYOUT(COMPLEX_KEY_HASHED())
 LIFETIME(MIN 300 MAX 3600);
 
-
 CREATE MATERIALIZED VIEW tech_tokens
 ENGINE = TinyLog
 AS
@@ -1029,34 +1066,50 @@ FROM tech_patterns
 WHERE is_regex = 0;
 
 /* 7.2  Raw signal sink (external scanners + CT heuristics) */
-
+DROP TABLE IF EXISTS tech_signals;
 CREATE TABLE IF NOT EXISTS tech_signals
 (
-    ts           DateTime64(3, 'UTC'),
+    -- Detection identity columns
     org_id UInt64 DEFAULT 0,
     registrable  String,
     tech         LowCardinality(String),
+    evidence     Array(Tuple(type String, value String)),
+
+    -- evidence_id: Uniquely identifies a normalized set of evidence for this detection.
+    -- Computed as the SipHash64 of a string concatenation of all sorted evidence elements,
+    -- where each element is type:value, array-sorted and joined with '\x1E' (ASCII record
+    -- separator), e.g.: [('dns','foo.com'),('asn','123')] -> sipHash64('asn:123+dns:foo.com')
+    -- Ensures deduplication even if array order differs.
+    evidence_id UInt64 MATERIALIZED
+        sipHash64(arrayStringConcat(
+            arrayMap(x -> concat(x.1, ':', x.2), arraySort(arrayDistinct(evidence))),
+            '\x1E'
+        )),
+
+    -- Latest metadata
+    ts           DateTime64(3, 'UTC'),
     confidence   Float32,
-    source LowCardinality(String), /* Conventional defaults: ct_heuristic, active_scan, proxycurl */
-    state Enum8(
+    source       LowCardinality(String), -- Conventional defaults: ct_heuristic, active_scan, proxycurl
+    state        Enum8(
         'active' = 1,
         'suppressed' = 2,
         'pending_review' = 3,
         'expired' = 4
     ) DEFAULT 'active',
-    evidence Array(Tuple(type String, value String)),
-    is_negative UInt8 DEFAULT 0
-) ENGINE = MergeTree
+    is_negative  UInt8 DEFAULT 0,
+
+    INDEX idx_org_id (org_id) TYPE set(0) GRANULARITY 1
+)
+ENGINE = ReplacingMergeTree(ts)
 PARTITION BY toYYYYMM(ts)
-ORDER BY (tech, ts);
+ORDER BY (org_id, tech, evidence_id);
 
-ALTER TABLE tech_signals
-  ADD INDEX IF NOT EXISTS idx_org_id (org_id) TYPE set(0) GRANULARITY 1;
-
-/* 7.3  CT-driven heuristic signals  (uses a *table* join) */
-DROP VIEW IF EXISTS mv_ct_tech_signals_token;
-CREATE MATERIALIZED VIEW mv_ct_tech_signals_token
+/* 7.3  CT-driven heuristic signals */
+DROP VIEW IF EXISTS mv_ct_tech_signals;
+CREATE MATERIALIZED VIEW mv_ct_tech_signals
+REFRESH EVERY 1 DAY OFFSET 6 HOUR RANDOMIZE FOR 1 HOUR
 TO tech_signals AS
+-- pattern match (dict_tech_patterns)
 SELECT
     now64()                       AS ts,
     df.org_id                     AS org_id,
@@ -1064,11 +1117,10 @@ SELECT
     tp.tech                       AS tech,
     tp.weight                     AS confidence,
     'ct_heuristic'                AS source,
-    [tuple('dns', df.dn)]         AS evidence,
+    arraySort(arrayDistinct([tuple('dns', df.dn)]))         AS evidence,
     0                             AS is_negative
 FROM dns_flat AS df
-CROSS JOIN
-(
+CROSS JOIN (
     SELECT pattern, tech, weight
     FROM dict_tech_patterns
     WHERE is_regex = 0
@@ -1076,15 +1128,13 @@ CROSS JOIN
 WHERE arrayExists(
           tok -> arrayExists(
                      pat -> positionCaseInsensitive(tok, pat) > 0,
-                     (SELECT groupArray(token) FROM tech_tokens)),
-          df.dn_tokens_full)
-  AND positionCaseInsensitive(df.dn, tp.pattern) > 0;
-
-
--- regex matches
-DROP VIEW IF EXISTS mv_ct_tech_signals_regex;
-CREATE MATERIALIZED VIEW mv_ct_tech_signals_regex
-TO tech_signals AS
+                     (SELECT groupArray(token) FROM tech_tokens)
+                 ),
+          df.dn_tokens_full
+      )
+  AND positionCaseInsensitive(df.dn, tp.pattern) > 0
+UNION ALL
+-- regex match (dict_regex_prefixes)
 SELECT
     now64()                 AS ts,
     df.org_id               AS org_id,
@@ -1092,11 +1142,10 @@ SELECT
     rp.tech                 AS tech,
     rp.weight               AS confidence,
     'ct_heuristic'          AS source,
-    [tuple('dns', df.dn)]   AS evidence,
+    arraySort(arrayDistinct([tuple('dns', df.dn)]))   AS evidence,
     0                       AS is_negative
 FROM dns_flat AS df
-CROSS JOIN
-(
+CROSS JOIN (
     SELECT regex_prefix, pattern, tech, weight
     FROM dict_regex_prefixes
 ) AS rp
@@ -1191,5 +1240,8 @@ INSERT INTO tech_patterns (id, pattern, is_regex, tech, weight) VALUES
 (6,'splunk',   0,'Splunk',    1.0),
 (7,'jenkins',  0,'Jenkins',   1.0),
 (8,'jfrog',    0,'JFrog',     1.0);
+
+INSERT INTO tech_patterns (id, pattern, is_regex, regex_prefix, tech, weight)
+VALUES (9, '^([a-z0-9-]+\\.)+ghe\\.com$', 1, 'ghe.com', 'GitHub Enterprise Cloud (Data Residency)', 1.0);
 
 SYSTEM RELOAD DICTIONARY dict_tech_patterns;
