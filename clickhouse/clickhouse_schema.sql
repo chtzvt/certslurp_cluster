@@ -30,7 +30,10 @@ dict_tech_patterns (HASHED dictionary) ←── tiny, versioned       │
 
 Org clustering, autocomplete & aliasing:
 
-    mv_org_roots → org_root_sets (periodic refresh)
+    mv_org_roots (periodic refresh)
+    │
+    ▼
+    org_roots → org_root_sets (periodic refresh)
     │
     └─→ org_alias_map (periodic refresh)
     └─→ org_autocomplete_clustered (periodic refresh)
@@ -56,13 +59,10 @@ ________________________________________________________________________
  - One row per (org_id, certificate)
  - Avoids arrayJoin at query time for exact org lookups.
 
-4. mv_org_signatures  (AggregatingMergeTree)
- - SipHash64 + bitmap(cert_sn) per (norm_key, org_id)
- - Supports fuzzy org similarity/autocomplete in milliseconds.
-
-5. mv_org_roots  (AggregatingMergeTree)
+5. org_roots  (AggregatingMergeTree)
  - Pre-deduped list of registrable domains for each org_id
  - Drives org_root_sets, which feeds alias clustering.
+ - Refreshed automatically; do not manually insert.
 
 6. org_root_sets  (periodically refreshed MergeTree)
  - Most recent root domain set per org_id (one row per org)
@@ -99,6 +99,38 @@ ________________________________________________________________________
 14. mv_partition_stats, slow_queries
  - System-level metrics and performance diagnostics
 
+________________________________________________________________________
+CLUSTERING & QUERYING ORGANIZATIONS
+________________________________________________________________________
+
+Each organization name is normalized into an org_id (UInt64) using org_id().
+
+Multiple `org_id`s that represent aliases (e.g., variants, subsidiaries, or naming differences) are grouped into clusters.
+
+Clusters are identified by a unique cluster_id, which is either:
+- The canonical_id from org_alias_map if aliases exist, or
+- The original org_id if no cluster exists.
+
+The org_alias_map table maintains mappings between alias org_ids and their canonical cluster_id.
+Clustering updates automatically on scheduled materialized view refreshes.
+
+The materialized view org_autocomplete_clustered resolves and exposes clusters, providing:
+- cluster_id — the unified cluster key
+- display_name — best canonical org name
+- aliases — array of known name variants
+- cert_count — total certs across cluster
+
+** Querying by cluster_id ensures unified, deduplicated results across all aliases. **
+
+Workflow to resolve user input:
+1. Normalize user input to org_id via org_id().
+2. Lookup corresponding cluster_id in org_alias_map.
+3. If no cluster exists, use org_id as cluster_id.
+4. Use cluster_id for all queries against clustered views/tables.
+
+This abstraction removes the need for manual alias expansion or fan-out in queries.
+
+==========================================================================
 ________________________________________________________________________
 TYPICAL QUERY PATTERNS
 ________________________________________________________________________
@@ -288,47 +320,33 @@ ORDER BY t.confidence DESC, t.tech
 * Given a user-typed org name, get cluster and all known aliases
 SELECT
     cluster_id,
-    display_name
+    display_name,
+    aliases
 FROM org_autocomplete_clustered
-WHERE arrayExists(x -> positionCaseInsensitive(x, 'jpmorgan') > 0, aliases)
-   OR display_name ILIKE '%jpmorgan%';
-
-
-* Find all facts and aliases for a known org_id
-SELECT
-    f.tech,
-    f.confidence,
-    f.last_seen,
-    o.display_name
-FROM org_tech_facts f
-JOIN org_autocomplete_clustered o ON f.org_id = o.cluster_id
-WHERE f.org_id = org_id('Acme Inc');
+WHERE arrayExists(x -> positionCaseInsensitive(x, 'AT&T') > 0, aliases)
+   OR display_name ILIKE '%AT&T%';
 
 * Autocomplete by organization name
 
 -- Position-independent 
 SELECT
-    org_id,
-    canonical_org_name(groupArray(org)) AS display_name
-FROM org_strings
-WHERE norm_token_key(org) ILIKE '%ven%'
-GROUP BY org_id
-ORDER BY
-    count() DESC,
-    display_name ASC
-LIMIT 10
+    cluster_id AS org_id,
+    display_name
+FROM org_autocomplete_clustered
+WHERE display_name ILIKE '%ven%'
+   OR arrayExists(x -> positionCaseInsensitive(x, 'ven') > 0, aliases)
+ORDER BY cert_count DESC, display_name ASC
+LIMIT 10;
 
 -- Only at start of search 
 SELECT
-    org_id,
-    canonical_org_name(groupArray(org)) AS display_name
-FROM org_strings
-WHERE org ILIKE 'Ven%'
-GROUP BY org_id
-ORDER BY
-    count() DESC,
-    display_name ASC
-LIMIT 10
+    cluster_id AS org_id,
+    display_name
+FROM org_autocomplete_clustered
+WHERE display_name ILIKE 'Ven%'
+   OR arrayExists(x -> positionCaseInsensitive(x, 'ven') = 1, aliases)
+ORDER BY cert_count DESC, display_name ASC
+LIMIT 10;
 
 ________________________________________________________________________
 MANAGING DETECTIONS
@@ -527,25 +545,33 @@ DROP FUNCTION IF EXISTS canonical_org_name;
 
 
 /* norm_token_key
+Deterministically normalizes an organization (or entity) name string into a concise, fuzzy-matchable token key.
 
-Deterministically normalizes an organization (or entity) name string to a simple, fuzzy-matchable token key.
+Purpose:
+- Enables fuzzy and loose deduplication, grouping, and searching of organization names.
+- Serves as the foundational normalization function for clustering or entity resolution workflows.
 
-* Enables Fuzzy/loose deduplication, grouping, or searching of organization names.
-* Used as the base for clustering or entity resolution.
+Normalization Process:
+1. Converts the input string to lowercase using UTF-8 safe lowercasing.
+2. Replaces selected punctuation characters ([, ( ), :, ;, /]) with spaces.
+3. Removes joining punctuation characters (hyphen '-', ampersand '&', period '.') entirely.
+4. Strips any remaining non-alphanumeric and non-whitespace characters.
+5. Splits the cleaned string into tokens on spaces.
+6. Filters out common organizational stopwords (e.g., inc, ltd, llc, corp, company, etc.) and tokens of length <= 1.
+7. Deduplicates tokens and sorts them alphabetically.
+8. Joins tokens back into a single space-separated string.
+9. If the resulting normalized key is empty, falls back to a simpler partial normalization which removes all punctuation and filters basic stopwords.
+10. If still empty, returns the original input string.
 
-== How it Works
-* Converts to lowercase.
-* Removes all non-alphanumeric characters (except whitespace).
-* Splits into tokens on spaces.
-* Removes common organization stopwords (Inc, Ltd, LLC, etc.) and any tokens of length ≤ 1.
-* Deduplicates and sorts tokens.
-* Joins them back into a space-separated string.
-
-== Example
-
+Example Usage:
 SELECT norm_token_key('AT&T Services, Inc.')  -- Returns: 'att services'
 SELECT norm_token_key('Queen’s University of Belfast')  -- Returns: 'belfast queens university'
+SELECT norm_token_key('F5, Inc.')  -- Returns: 'f5'
 
+Note:
+- This function is designed to balance aggressive normalization with the need to preserve meaningful tokens.
+- Hyphenated names like "T-Mobile" normalize to "tmobile" by removing the hyphen.
+- Stopword filtering is customizable via the underlying stopword list in norm_token_key_filter_stopwords.
 
 Stopword list can be tuned with results from:
 
@@ -554,36 +580,67 @@ SELECT
     count() AS n
 FROM
 (
-    SELECT arrayDistinct(splitByChar(' ', norm_token_key(org))) AS tokens
-    FROM org_strings
+    SELECT
+        arrayJoin(arrayDistinct(
+            arrayConcat(
+                splitByChar(' ', display_name),
+                arrayMap(alias -> arrayJoin(splitByChar(' ', alias)), aliases)
+            )
+        )) AS token
+    FROM org_autocomplete_clustered
 )
-ARRAY JOIN tokens AS token
 GROUP BY token
 ORDER BY n DESC
-LIMIT 50
+LIMIT 50;
 */
-CREATE OR REPLACE FUNCTION norm_token_key AS
-  (s) -> arrayStringConcat(
-           arraySort(
-             arrayFilter(
-               x -> length(x) > 1 AND NOT x IN ('inc','incorporated','llc','co','company','corp','corporation','ltd','limited','sa','gmbh','the','and','&','-','of',
-               'pvt','llp','bv','spa','as','oy','aps','ab','sarl','nv','ag','sl','sas','kg','kgaa','pte','plc','ltda','sl','pty','srl','at','for',
-               'gesellschaft','societe','société','empresa','firma','compania','compañía','compañia','associés','vereniging'),
-                arrayDistinct(
-                 splitByChar(
-                   ' ',
-                   replaceRegexpAll(
-                     lowerUTF8(s),
-                     '[^\\p{L}\\p{N}\\s]+',  -- only spaces are preserved, all else removed before tokenization step
-                     ''
-                   )
-                 )
-               )
-             )
-           ),
-           ' '
-         );
+CREATE OR REPLACE FUNCTION norm_token_key_filter_stopwords AS
+  (tokens, min_len) -> arrayFilter(
+    x -> length(x) > min_len AND NOT x IN (
+      'inc','incorporated','llc','co','company','corp','corporation','ltd','limited','sa','gmbh',
+      'the','and','&','-','of','pvt','llp','bv','spa','as','oy','aps','ab','sarl','nv','ag','sl',
+      'sas','kg','kgaa','pte','plc','ltda','sl','pty','srl','at','for','se','sp','com','www',
+      'gesellschaft','societe','société','empresa','firma','compania','compañía','compania','associés','vereniging',
+      'de','del'
+    ),
+    tokens
+  );
 
+CREATE OR REPLACE FUNCTION norm_token_key_full AS
+  (s) -> arrayStringConcat(
+    arraySort(
+      arrayDistinct(
+        norm_token_key_filter_stopwords(
+          splitByChar(
+            ' ',
+            replaceRegexpAll(
+              replaceRegexpAll(replaceRegexpAll(lowerUTF8(s), '[,():;\/]', ' '), '[\-\&.]', ''),
+              '[^\\p{L}\\p{N}\\s]+',
+              ''
+            )
+          ),
+          1
+        )
+      )
+    ),
+    ' '
+  );
+
+CREATE OR REPLACE FUNCTION norm_token_key_partial AS
+  (s) -> arrayStringConcat(
+    norm_token_key_filter_stopwords(
+      splitByChar(
+        ' ',
+        replaceRegexpAll(lowerUTF8(s), '[^\\p{L}\\p{N}\\s]+', '')
+      ),
+      0
+    ),
+    ' '
+  );
+
+CREATE OR REPLACE FUNCTION norm_token_key AS
+  (s) ->
+    if(length(norm_token_key_full(s)) > 0, norm_token_key_full(s),
+       if(length(norm_token_key_partial(s)) > 0, norm_token_key_partial(s), s));
 
 /* org_id
 
@@ -617,13 +674,12 @@ entity resolution, autocomplete, or any use-case with many noisy string variants
 Typically used over a grouped array of org names, e.g.:
 
 SELECT
-    org_id,
-    arraySlice(groupArray(org), 1, 5) AS org_examples,
-    canonical_org_name(groupArray(org)) AS canonical
-FROM org_strings
-GROUP BY org_id
-ORDER BY count() DESC
-LIMIT 100
+    cluster_id AS org_id,
+    arraySlice(aliases, 1, 5) AS org_examples,
+    display_name AS canonical
+FROM org_autocomplete_clustered
+ORDER BY length(aliases) DESC
+LIMIT 100;
 
 Examples:
 
@@ -766,11 +822,8 @@ ALTER TABLE ct_certificates
   2.  Domain-flattened view  (one row per SAN)
 -----------------------------------------------------------------------*/
 DROP TABLE IF EXISTS dns_flat;
-
 CREATE TABLE dns_flat
 (
-    ver          UInt64 MATERIALIZED sipHash64(sn),
-
     dn           String,
     registrable  String,
     root         String,
@@ -792,7 +845,7 @@ CREATE TABLE dns_flat
     INDEX idx_dn_token_array  dn_tokens      TYPE tokenbf_v1(2048,3,0) GRANULARITY 4,
     INDEX idx_dn_tokens_full dn_tokens_full TYPE tokenbf_v1(2048,3,0) GRANULARITY 4
 )
-ENGINE = ReplacingMergeTree(ver)
+ENGINE = ReplacingMergeTree(lts)
 PARTITION BY toYYYYMM(lts)
 ORDER BY dn;
 
@@ -837,16 +890,32 @@ FROM ct_certificates;
 /*-----------------------------------------------------------------------
   4.  Org → registrable-domain roll-up
 -----------------------------------------------------------------------*/
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_org_roots
+/* This table is automatically maintained by mv_org_roots.
+   Do not manually write to this table, it will refresh on a schedule. */
+CREATE TABLE IF NOT EXISTS org_roots
+(
+    norm_key String,
+    org_id UInt64,
+    roots Array(String),
+    root_cnt UInt64,
+    min_nbf DateTime64(0, 'UTC'),
+    max_naf DateTime64(0, 'UTC'),
+    min_lts DateTime64(6, 'UTC'),
+    max_lts DateTime64(6, 'UTC')
+)
 ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(min_lts)
-ORDER BY (norm_key, org_id)
-AS
+ORDER BY (norm_key, org_id);
+
+DROP VIEW IF EXISTS mv_org_roots;
+CREATE MATERIALIZED VIEW mv_org_roots
+REFRESH EVERY 1 DAY OFFSET 1 HOUR RANDOMIZE FOR 1 HOUR
+TO org_roots AS
 SELECT
-    norm_token_key(organization)   AS norm_key,
-    org_id(organization)           AS org_id,
-    groupUniqArray(registrable)    AS roots,
-    countDistinct(registrable)     AS root_cnt,
+    norm_token_key(organization) AS norm_key,
+    org_id(organization) AS org_id,
+    groupUniqArray(registrable) AS roots,
+    countDistinct(registrable) AS root_cnt,
     min(nbf) AS min_nbf,
     max(nbf) AS max_naf,
     min(lts) AS min_lts,
@@ -868,7 +937,7 @@ ORDER BY org_id;
 DROP VIEW IF EXISTS org_root_sets_mv;
 
 CREATE MATERIALIZED VIEW org_root_sets_mv
-REFRESH EVERY 1 DAY OFFSET 1 HOUR RANDOMIZE FOR 1 HOUR
+REFRESH EVERY 1 DAY OFFSET 3 HOUR RANDOMIZE FOR 1 HOUR
 TO org_root_sets AS
 SELECT
     org_id,
@@ -877,50 +946,13 @@ SELECT
 FROM (
     SELECT *,
         row_number() OVER (PARTITION BY org_id ORDER BY min_nbf DESC) AS rn
-    FROM mv_org_roots
+    FROM org_roots
 )
 WHERE rn = 1;
 
 /*-----------------------------------------------------------------------
   5.  Organization SipHash signatures + autocomplete (fuzzy backbone)
 -----------------------------------------------------------------------*/
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_org_signatures
-ENGINE = AggregatingMergeTree
-PARTITION BY toYYYYMM(min_lts)
-ORDER BY norm_key
-AS
-SELECT
-    norm_token_key(arrayJoin(org))        AS norm_key,
-    org_id(arrayJoin(org))                AS org_id,
-    sipHash64(norm_key)                   AS sh64,
-    anyHeavy(arrayJoin(org))              AS one_example,
-    groupBitmapState(sipHash64(sn))       AS sn_bitmap,
-    min(nbf)                              AS min_nbf,
-    max(nbf)                              AS max_naf,
-    min(lts) AS min_lts,
-    max(lts) AS max_lts
-FROM ct_certificates
-GROUP BY norm_key, org_id;
-
-CREATE TABLE org_strings
-(
-    org String,
-    org_id UInt64 MATERIALIZED org_id(org),
-
-
-    INDEX idx_org_prefix (org) TYPE tokenbf_v1(2048, 3, 0) GRANULARITY 4,
-    INDEX idx_org_ngram (org) TYPE ngrambf_v1(3, 2048, 3, 0) GRANULARITY 4
-)
-ENGINE = MergeTree
-ORDER BY org 
-SETTINGS index_granularity = 8192;
-
-DROP VIEW IF EXISTS mv_org_strings;
-CREATE MATERIALIZED VIEW mv_org_strings
-TO org_strings
-AS
-SELECT DISTINCT arrayJoin(org) AS org
-FROM ct_certificates;
 
 /* This table is automatically maintained by org_alias_map_mv.
    Do not manually write to this table, it will refresh on a schedule. */
@@ -938,7 +970,7 @@ JOIN org_root_sets b ON a.org_id < b.org_id
 WHERE length(arrayIntersect(a.roots, b.roots)) >= 2;
 
 CREATE MATERIALIZED VIEW org_alias_map_mv
-REFRESH EVERY 1 DAY OFFSET 3 HOUR RANDOMIZE FOR 1 HOUR
+REFRESH EVERY 1 DAY OFFSET 5 HOUR RANDOMIZE FOR 1 HOUR
 TO org_alias_map AS
 SELECT
     a.org_id                                  AS alias_id,
@@ -962,14 +994,14 @@ CREATE TABLE org_autocomplete_clustered
     INDEX idx_display_name_tokenbf (display_name) TYPE tokenbf_v1(2048, 3, 0) GRANULARITY 4,
     INDEX idx_display_name_ngram   (display_name) TYPE ngrambf_v1(3, 2048, 3, 0) GRANULARITY 4,
     INDEX idx_aliases_tokenbf      (aliases)      TYPE tokenbf_v1(2048, 3, 0) GRANULARITY 4,
-    INDEX idx_aliases_ngram        (aliases)      TYPE ngrambf_v1(3, 2048, 3, 0) GRANULARITY 4
+    INDEX idx_aliases_ngram        (aliases)      TYPE ngrambf_v1(3, 2048, 3, 0) GRANULARITY 4,
 )
 ENGINE = MergeTree
 ORDER BY (cert_count DESC, display_name)
 SETTINGS index_granularity = 8192, allow_experimental_reverse_key = 1;
 
 CREATE MATERIALIZED VIEW org_autocomplete_clustered_mv
-REFRESH EVERY 1 DAY OFFSET 50 MINUTE
+REFRESH EVERY 1 DAY OFFSET 7 HOUR RANDOMIZE FOR 1 HOUR
 TO org_autocomplete_clustered AS
 SELECT
     if(m.canonical_id != 0, m.canonical_id, c.org_id) AS cluster_id,
@@ -999,7 +1031,7 @@ CREATE DICTIONARY IF NOT EXISTS dict_org_roots
     roots    Array(String)
 )
 PRIMARY KEY norm_key
-SOURCE(CLICKHOUSE(TABLE 'mv_org_roots'))
+SOURCE(CLICKHOUSE(TABLE 'org_roots'))
 LAYOUT(FLAT())
 LIFETIME(MIN 300 MAX 3600);
 
@@ -1161,30 +1193,30 @@ WHERE (rp.regex_prefix = ''
 
 
 /* 7.4  Aggregated truth table  (org × tech) */
+DROP TABLE IF EXISTS org_tech_facts;
+CREATE TABLE org_tech_facts
+(
+    org_id UInt64,
+    tech String,
+    confidence Float32,
+    last_seen DateTime64(3, 'UTC')
+)
+ENGINE = ReplacingMergeTree(last_seen)
+PARTITION BY toYYYYMM(last_seen)
+ORDER BY (org_id, tech);
+
+
 DROP VIEW IF EXISTS mv_org_tech;
 CREATE MATERIALIZED VIEW mv_org_tech
-ENGINE = AggregatingMergeTree
-PARTITION BY month
-ORDER BY (org_id, tech)
-AS
+REFRESH AFTER 4 HOUR RANDOMIZE FOR 1 HOUR
+TO org_tech_facts AS
 SELECT
     org_id,
     tech,
-    maxState(confidence) AS conf_state,
-    maxState(ts)         AS last_seen_state,
-    anyHeavy(toYYYYMM(ts)) AS month,
-    maxState(is_negative) AS suppression_state
+    IF(max(is_negative) = 1, 0, max(confidence)) AS confidence,
+    max(ts) AS last_seen
 FROM tech_signals
 GROUP BY org_id, tech;
-
-CREATE OR REPLACE VIEW org_tech_facts AS
-SELECT
-    org_id,
-    tech,
-    -- If suppression_state==1, force confidence to zero
-    IF(finalizeAggregation(suppression_state)=1, 0, finalizeAggregation(conf_state)) AS confidence,
-    toDateTime64(finalizeAggregation(last_seen_state), 3) AS last_seen
-FROM mv_org_tech;
 
 /*-----------------------------------------------------------------------
   8. Observability
