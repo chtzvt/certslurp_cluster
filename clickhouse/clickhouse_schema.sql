@@ -116,7 +116,7 @@ SELECT
     evidence
 FROM tech_signals
 WHERE org_id = org_id('JPMorgan Chase')
-  AND tech = 'GitLab'
+  AND tech = 'GitHub'
   AND confidence >= 0.5
 ORDER BY ts DESC
 LIMIT 50;
@@ -133,19 +133,6 @@ WHERE org_id = org_id('JPMorgan Chase')
   AND confidence >= 0.5
 ORDER BY tech, ts DESC
 LIMIT 200;
-
-Grouped by tech:
-
-SELECT
-    t.tech,
-    arrayJoin(t.evidence) AS evidence_detail,
-    t.confidence,
-    t.ts
-FROM tech_signals AS t
-WHERE t.org_id = org_id('JPMorgan Chase')
-  AND t.confidence >= 0.5
-ORDER BY t.tech, t.ts DESC
-LIMIT 200
 
 As a single array:
 
