@@ -782,7 +782,7 @@ CREATE TABLE IF NOT EXISTS ct_certificates
     li  UInt64,
     lts DateTime64(6, 'UTC')
 )
-ENGINE = MergeTree
+ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(lts)          -- append-only
 ORDER BY (log, li)
 SAMPLE BY li
