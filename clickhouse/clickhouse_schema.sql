@@ -489,6 +489,25 @@ WHERE query_duration_ms > 10000
 ORDER BY event_time DESC
 LIMIT 10;
 
+==== Table and Column Sizes / Compression Stats ==== 
+
+SELECT
+    name,
+    formatReadableSize(sum(data_compressed_bytes)) AS compressed_size,
+    formatReadableSize(sum(data_uncompressed_bytes)) AS uncompressed_size,
+    round(sum(data_uncompressed_bytes) / sum(data_compressed_bytes), 2) AS ratio
+FROM system.columns
+WHERE table = 'ct_certificates'
+GROUP BY name
+ORDER BY sum(data_compressed_bytes) DESC
+
+SELECT
+    formatReadableSize(sum(data_compressed_bytes)) AS compressed_size,
+    formatReadableSize(sum(data_uncompressed_bytes)) AS uncompressed_size,
+    round(sum(data_uncompressed_bytes) / sum(data_compressed_bytes), 2) AS ratio
+FROM system.columns
+WHERE table = 'ct_certificates'
+
 ________________________________________________________________________
 SCHEMA MAINTENANCE / WRITING
 ________________________________________________________________________
