@@ -57,6 +57,27 @@ sudo apt-get update
 
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y clickhouse-server clickhouse-client
 
+cat >/etc/systemd/system/disable-thp.service <<EOF
+[Unit]
+Description=Disable Transparent Huge Pages
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/enabled && echo never > /sys/kernel/mm/transparent_hugepage/defrag'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now disable-thp.service
+
+cat >/etc/sysctl.d/99-delayacct.conf <<EOF
+kernel.task_delayacct = 1
+EOF
+
+sudo sysctl -p /etc/sysctl.d/99-delayacct.conf
+
 # Configure Clickhouse data directories
 mkdir -p "$MOUNT_POINT/data" "$MOUNT_POINT/tmp" "$MOUNT_POINT/user_files" "$MOUNT_POINT/access" "$MOUNT_POINT/ddl_queue"
 chown -R clickhouse:clickhouse "$MOUNT_POINT"
