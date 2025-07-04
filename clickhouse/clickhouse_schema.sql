@@ -816,7 +816,8 @@ ALTER TABLE ct_certificates
 /* secondary indexes */
 ALTER TABLE ct_certificates
     ADD INDEX IF NOT EXISTS idx_dns_bloom  dns TYPE bloom_filter(0.02) GRANULARITY 2,
-    ADD INDEX IF NOT EXISTS idx_issuer     iss TYPE tokenbf_v1(2048,3,0)      GRANULARITY 4;
+    ADD INDEX IF NOT EXISTS idx_cn     cn TYPE tokenbf_v1(2048,3,0)      GRANULARITY 4,
+    ADD INDEX IF NOT EXISTS idx_sub    sub TYPE tokenbf_v1(2048,3,0)      GRANULARITY 4;
 
 /*-----------------------------------------------------------------------
   2.  Domain-flattened view  (one row per SAN)
@@ -843,14 +844,16 @@ CREATE TABLE dns_flat
     /* token Bloom on scalar domains */
     INDEX idx_dn_token_scalar dn TYPE tokenbf_v1(2048,3,0) GRANULARITY 4, 
     INDEX idx_dn_token_array  dn_tokens      TYPE tokenbf_v1(2048,3,0) GRANULARITY 4,
-    INDEX idx_dn_tokens_full dn_tokens_full TYPE tokenbf_v1(2048,3,0) GRANULARITY 4
+    INDEX idx_dn_tokens_full dn_tokens_full TYPE tokenbf_v1(2048,3,0) GRANULARITY 4,
+
+    -- index on country
+    INDEX idx_country country TYPE set(0) GRANULARITY 1
 )
 ENGINE = ReplacingMergeTree(lts)
 PARTITION BY toYYYYMM(lts)
-ORDER BY dn;
+ORDER BY (country, registrable, root, dn);
 
 DROP VIEW IF EXISTS mv_dns_flat;
-
 CREATE MATERIALIZED VIEW mv_dns_flat
 TO dns_flat AS
 SELECT
@@ -876,25 +879,28 @@ FROM ct_certificates;
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_org_cert
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(lts)
-ORDER BY (organization, sn)
+ORDER BY (org_id, sn)
 AS
 SELECT
-    arrayJoin(org) AS organization,
-    org_id(organization) AS org_id,
+    org_id(org) AS org_id,
     sn,
     nbf,
     naf, 
     lts
-FROM ct_certificates;
+FROM ct_certificates
+ARRAY JOIN org
+WHERE org != '';
 
 /*-----------------------------------------------------------------------
   4.  Org → registrable-domain roll-up
 -----------------------------------------------------------------------*/
-/* This table is automatically maintained by mv_org_roots.
+/* 
+   Accumulates all historical aggregates for each org_id (potentially multiple versions).
+
+   This table is automatically maintained by mv_org_roots.
    Do not manually write to this table, it will refresh on a schedule. */
 CREATE TABLE IF NOT EXISTS org_roots
 (
-    norm_key String,
     org_id UInt64,
     roots Array(String),
     root_cnt UInt64,
@@ -905,14 +911,13 @@ CREATE TABLE IF NOT EXISTS org_roots
 )
 ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(min_lts)
-ORDER BY (norm_key, org_id);
+ORDER BY (org_id);
 
 DROP VIEW IF EXISTS mv_org_roots;
 CREATE MATERIALIZED VIEW mv_org_roots
 REFRESH EVERY 1 DAY OFFSET 1 HOUR RANDOMIZE FOR 1 HOUR
 TO org_roots AS
 SELECT
-    norm_token_key(organization) AS norm_key,
     org_id(organization) AS org_id,
     groupUniqArray(registrable) AS roots,
     countDistinct(registrable) AS root_cnt,
@@ -921,9 +926,12 @@ SELECT
     min(lts) AS min_lts,
     max(lts) AS max_lts
 FROM dns_flat
-GROUP BY norm_key, org_id;
+GROUP BY org_id;
 
-/* This table is automatically maintained by org_root_sets_mv.
+/*
+   Stores only the latest, deduplicated snapshot of roots per org_id.
+
+   This table is automatically maintained by org_root_sets_mv.
    Do not manually write to this table, it will refresh on a schedule. */
 CREATE OR REPLACE TABLE org_root_sets
 (
@@ -1027,10 +1035,10 @@ ORDER BY cert_count DESC;
 
 CREATE DICTIONARY IF NOT EXISTS dict_org_roots
 (
-    norm_key String,
+    org_id UInt64,
     roots    Array(String)
 )
-PRIMARY KEY norm_key
+PRIMARY KEY org_id
 SOURCE(CLICKHOUSE(TABLE 'org_roots'))
 LAYOUT(FLAT())
 LIFETIME(MIN 300 MAX 3600);
@@ -1116,7 +1124,7 @@ CREATE TABLE IF NOT EXISTS tech_signals
     -- evidence_id: Uniquely identifies a normalized set of evidence for this detection.
     -- Computed as the SipHash64 of a string concatenation of all sorted evidence elements,
     -- where each element is type:value, array-sorted and joined with '\x1E' (ASCII record
-    -- separator), e.g.: [('dns','foo.com'),('asn','123')] -> sipHash64('asn:123+dns:foo.com')
+    -- separator), e.g.: [('dns','foo.com'),('asn','123')] -> sipHash64('asn:123\x1Edns:foo.com')
     -- Ensures deduplication even if array order differs.
     evidence_id UInt64 MATERIALIZED
         sipHash64(arrayStringConcat(
