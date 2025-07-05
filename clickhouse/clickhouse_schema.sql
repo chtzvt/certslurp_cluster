@@ -1030,24 +1030,10 @@ GROUP BY cluster_id
 ORDER BY cert_count DESC;
 
 /*-----------------------------------------------------------------------
-  6.  Low-latency dictionaries
+  6.  Technology-matching components
 -----------------------------------------------------------------------*/
 
-CREATE DICTIONARY IF NOT EXISTS dict_org_roots
-(
-    org_id UInt64,
-    roots    Array(String)
-)
-PRIMARY KEY org_id
-SOURCE(CLICKHOUSE(TABLE 'org_roots'))
-LAYOUT(FLAT())
-LIFETIME(MIN 300 MAX 3600);
-
-/*-----------------------------------------------------------------------
-  7.  Technology-matching components
------------------------------------------------------------------------*/
-
-/* 7.1  Pattern dictionary (tiny, hand-editable) */
+/* 6.1  Pattern dictionary (tiny, hand-editable) */
 CREATE TABLE tech_patterns
 (
     id            UInt32,
@@ -1111,7 +1097,7 @@ SELECT id,
 FROM tech_patterns
 WHERE is_regex = 0;
 
-/* 7.2  Raw signal sink (external scanners + CT heuristics) */
+/* 6.2  Raw signal sink (external scanners + CT heuristics) */
 DROP TABLE IF EXISTS tech_signals;
 CREATE TABLE IF NOT EXISTS tech_signals
 (
@@ -1150,7 +1136,7 @@ ENGINE = ReplacingMergeTree(ts)
 PARTITION BY toYYYYMM(ts)
 ORDER BY (org_id, tech, evidence_id);
 
-/* 7.3  CT-driven heuristic signals */
+/* 6.3  CT-driven heuristic signals */
 DROP VIEW IF EXISTS mv_ct_tech_signals;
 CREATE MATERIALIZED VIEW mv_ct_tech_signals
 REFRESH EVERY 1 DAY OFFSET 6 HOUR RANDOMIZE FOR 1 HOUR
@@ -1200,7 +1186,7 @@ WHERE (rp.regex_prefix = ''
   AND match(df.dn, rp.pattern);
 
 
-/* 7.4  Aggregated truth table  (org × tech) */
+/* 6.4  Aggregated truth table  (org × tech) */
 DROP TABLE IF EXISTS org_tech_facts;
 CREATE TABLE org_tech_facts
 (
@@ -1227,7 +1213,7 @@ FROM tech_signals
 GROUP BY org_id, tech;
 
 /*-----------------------------------------------------------------------
-  8. Observability
+  7. Observability
 -----------------------------------------------------------------------*/
 
 CREATE TABLE IF NOT EXISTS etl_ingest_metrics
@@ -1275,7 +1261,7 @@ ENGINE = MergeTree
 ORDER BY event_time;
 
 /*-----------------------------------------------------------------------
-  9. Seeds
+  8. Seeds
 -----------------------------------------------------------------------*/
 INSERT INTO tech_patterns (id, pattern, is_regex, tech, weight) VALUES
 (1,'bitbucket',0,'Bitbucket', 1.0),
