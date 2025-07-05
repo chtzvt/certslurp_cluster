@@ -275,6 +275,16 @@ SELECT * FROM org_autocomplete_clustered
 WHERE length(aliases) > 1
 ORDER BY cert_count DESC;
 
+* List organizations ordered by number of distinct roots:
+SELECT
+    c.display_name,
+    r.org_id,
+    length(r.roots) AS roots_count
+FROM org_roots AS r
+LEFT JOIN org_autocomplete_clustered AS c
+    ON r.org_id = c.cluster_id
+ORDER BY roots_count DESC
+LIMIT 10;
 
 * Fuzzy search for orgs containing "acme" (case-insensitive, matches aliases or display_name)
 SELECT
