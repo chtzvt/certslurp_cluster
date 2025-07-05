@@ -553,15 +553,15 @@ Purpose:
 
 Normalization Process:
 1. Converts the input string to lowercase using UTF-8 safe lowercasing.
-2. Replaces selected punctuation characters ([, ( ), :, ;, /]) with spaces.
-3. Removes joining punctuation characters (hyphen '-', ampersand '&', period '.') entirely.
-4. Strips any remaining non-alphanumeric and non-whitespace characters.
-5. Splits the cleaned string into tokens on spaces.
-6. Filters out common organizational stopwords (e.g., inc, ltd, llc, corp, company, etc.) and tokens of length <= 1.
-7. Deduplicates tokens and sorts them alphabetically.
-8. Joins tokens back into a single space-separated string.
-9. If the resulting normalized key is empty, falls back to a simpler partial normalization which removes all punctuation and filters basic stopwords.
-10. If still empty, returns the original input string.
+2. Splits the string into chunks on spaces
+3. Checks the current chunk. 
+  3a. If it looks like an acronym (e.g. M.I.T.), it'll strip all . characters at once
+  3b. Otherwise, it'll strip any non-. letter/number, then split on . (e.g. "salesforce.com" -> "salesforce","com", "l'oreal"->"loreal")
+4. Filters out common organizational stopwords (e.g., inc, ltd, llc, corp, company, etc.) and tokens of length <= 1.
+5. Deduplicates tokens and sorts them alphabetically.
+6. Joins tokens back into a single space-separated string.
+7. If the resulting normalized key is empty, falls back to a simpler partial normalization (norm_token_key_partial) which removes all punctuation and filters basic stopwords.
+8. If still empty, returns the original input string.
 
 Example Usage:
 SELECT norm_token_key('AT&T Services, Inc.')  -- Returns: 'att services'
@@ -572,6 +572,27 @@ Note:
 - This function is designed to balance aggressive normalization with the need to preserve meaningful tokens.
 - Hyphenated names like "T-Mobile" normalize to "tmobile" by removing the hyphen.
 - Stopword filtering is customizable via the underlying stopword list in norm_token_key_filter_stopwords.
+
+
+Can be tested with:
+
+SELECT
+    org_name,
+    norm_token_key_full(org_name) AS full,
+    norm_token_key_partial(org_name) AS fallback
+FROM
+(
+  SELECT arrayJoin(['F5, Inc.', 'AT&T Services, Inc.', 'E.C.L. LIMITED', 'S.I.C.E.S. S.R.L.', 
+    'Salesforce Inc', 'Salesforce.com, Inc', 'A Company Srl', 'O\'Reilly Media, Inc.', 'J.P. Morgan Chase & Co.', 
+    'Alphabet, Inc.', 'Google LLC', 'M.I.T.', 'L\'Oréal S.A.', 'Bayerische Motoren Werke AG', '123 Industries', 
+    'Acme Corp.', 'N/A Corp', 'Example LLC - Division 5', 'Foo & Bar Co.', 'ACME, Co.', 'Nippon Steel & Sumitomo Metal Corporation', 
+    'Telefonaktiebolaget LM Ericsson', 'Renault S.A.S.', 'KPMG LLP', 'R&D Solutions Inc.', 'D&B Corporation', 
+    'T-Mobile US, Inc.', 'Schrödinger GmbH', 'NVIDIA Corporation', 'H&M Hennes & Mauritz AB', 'LVMH Moët Hennessy Louis Vuitton', 
+    'Tata Consultancy Services Limited', 'Zoë & Co.', 'Company XYZ, Ltd.', '3M Company', '7-Eleven, Inc.', 'Smith, Johnson & Associates', 
+    'G.E. Healthcare', 'The Walt Disney Company', 'Coca-Cola Co.', 'Deloitte LLP', 'Ernst & Young LLP', 'PwC (PricewaterhouseCoopers)', 
+    'BASF SE', 'Müller GmbH & Co. KG', 'Renée\'s Café & Bakery, LLC']) 
+  AS org_name
+)
 
 Stopword list can be tuned with results from:
 
@@ -605,34 +626,45 @@ CREATE OR REPLACE FUNCTION norm_token_key_filter_stopwords AS
     tokens
   );
 
-CREATE OR REPLACE FUNCTION norm_token_key_full AS
-  (s) -> arrayStringConcat(
+CREATE OR REPLACE FUNCTION norm_token_key_full AS s ->
+arrayStringConcat(
     arraySort(
-      arrayDistinct(
-        norm_token_key_filter_stopwords(
-          splitByChar(
-            ' ',
-            replaceRegexpAll(
-              replaceRegexpAll(replaceRegexpAll(lowerUTF8(s), '[,():;\/]', ' '), '[\-\&.]', ''),
-              '[^\\p{L}\\p{N}\\s]+',
-              ''
+        arrayDistinct(
+            norm_token_key_filter_stopwords(
+                arrayFlatten(
+                    arrayMap(
+                        chunk ->
+                            if(
+                                match(chunk, '^(\\p{L}\.){2,}$'),
+                                -- it’s a dot-acronym: remove all dots at once
+                                [ replaceRegexpAll(chunk, '\\.', '') ],
+                                -- otherwise: strip any non-dot letter/number, then split on dot
+                                splitByRegexp('[^\\p{L}\\p{N}]+', replaceRegexpAll(chunk, '[^\p{L}\p{N}.]', ''))
+                            ),
+                        -- first, split the entire string on spaces
+                        splitByChar(' ', lowerUTF8(s))
+                    )
+                ),
+                1
             )
-          ),
-          1
         )
-      )
     ),
     ' '
-  );
+);
+
 
 CREATE OR REPLACE FUNCTION norm_token_key_partial AS
   (s) -> arrayStringConcat(
-    norm_token_key_filter_stopwords(
-      splitByChar(
-        ' ',
-        replaceRegexpAll(lowerUTF8(s), '[^\\p{L}\\p{N}\\s]+', '')
-      ),
-      0
+    arraySort(
+     arrayDistinct(
+      norm_token_key_filter_stopwords(
+        splitByChar(
+          ' ',
+          replaceRegexpAll(lowerUTF8(s), '[^\\p{L}\\p{N}\\s]+', '')
+        ),
+        0
+      )
+     )
     ),
     ' '
   );
