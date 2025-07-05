@@ -573,6 +573,19 @@ Note:
 - Hyphenated names like "T-Mobile" normalize to "tmobile" by removing the hyphen.
 - Stopword filtering is customizable via the underlying stopword list in norm_token_key_filter_stopwords.
 
+If you update these functions, you will need to:
+
+Clear the aggregated tables (n.b. these might change):
+TRUNCATE TABLE org_roots;
+TRUNCATE TABLE org_root_sets;
+TRUNCATE TABLE org_alias_map;
+TRUNCATE TABLE org_autocomplete_clustered;
+
+Trigger manual refreshes in the correct order (n.b. these also might change):
+SYSTEM REFRESH VIEW mv_org_roots;
+SYSTEM REFRESH VIEW org_root_sets_mv;
+SYSTEM REFRESH VIEW org_alias_map_mv;
+SYSTEM REFRESH VIEW org_autocomplete_clustered_mv;
 
 Can be tested with:
 
