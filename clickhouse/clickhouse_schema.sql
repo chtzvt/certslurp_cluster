@@ -612,13 +612,7 @@ SELECT
     count() AS n
 FROM
 (
-    SELECT
-        arrayJoin(arrayDistinct(
-            arrayConcat(
-                splitByChar(' ', display_name),
-                arrayMap(alias -> arrayJoin(splitByChar(' ', alias)), aliases)
-            )
-        )) AS token
+    SELECT arrayJoin(splitByChar(' ', norm_token_key(display_name))) AS token
     FROM org_autocomplete_clustered
 )
 GROUP BY token
