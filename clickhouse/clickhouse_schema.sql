@@ -822,7 +822,6 @@ CREATE TABLE IF NOT EXISTS ct_certificates
 ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(lts)          -- append-only
 ORDER BY (log, li)
-SAMPLE BY li
 SETTINGS
     index_granularity       = 8192,
     min_bytes_for_wide_part = 134217728;
@@ -865,7 +864,9 @@ CREATE TABLE dns_flat
     dn           String,
     registrable  String,
     root         String,
-    dn_tokens    Array(String),
+    tld          String,
+    depth        UInt8,
+    wildcard     Bool,
     dn_tokens_full Array(String),
 
     organization String,
@@ -880,7 +881,7 @@ CREATE TABLE dns_flat
 
     /* token Bloom on scalar domains */
     INDEX idx_dn_token_scalar dn TYPE tokenbf_v1(2048,3,0) GRANULARITY 4, 
-    INDEX idx_dn_token_array  dn_tokens      TYPE tokenbf_v1(2048,3,0) GRANULARITY 4,
+    INDEX idx_tld  tld           TYPE tokenbf_v1(2048,3,0) GRANULARITY 4,
     INDEX idx_dn_tokens_full dn_tokens_full TYPE tokenbf_v1(2048,3,0) GRANULARITY 4,
 
     -- index on country
@@ -894,11 +895,13 @@ DROP VIEW IF EXISTS mv_dns_flat;
 CREATE MATERIALIZED VIEW mv_dns_flat
 TO dns_flat AS
 SELECT
-    lower(arrayJoin(arrayDistinct(dns)))               AS dn,
+    lowerUTF8(arrayJoin(arrayDistinct(dns)))           AS dn,
     cutToFirstSignificantSubdomain(dn)                 AS registrable,
     firstSignificantSubdomain(dn)                      AS root,
-    splitByRegexp('[^\\p{L}\\p{N}]+', root)            AS dn_tokens,
-    splitByRegexp('[^\\p{L}\\p{N}]+', dn)              AS dn_tokens_full,
+    topLevelDomain(registrable)                        AS tld,
+    length(splitByChar('.', dn))                       AS depth,
+    startsWith(dn, '*.')                               AS wildcard,
+    arrayFilter(x -> length(x) > 0, splitByChar('.', lowerUTF8(dn))) AS dn_tokens_full,
 
     arrayJoin(org)                                     AS organization,
     arrayElement(ou,  1)                               AS ou,
@@ -1234,7 +1237,7 @@ CREATE TABLE org_tech_facts
 )
 ENGINE = ReplacingMergeTree(last_seen)
 PARTITION BY toYYYYMM(last_seen)
-ORDER BY (org_id, tech);
+ORDER BY (org_id, last_seen, tech);
 
 
 DROP VIEW IF EXISTS mv_org_tech;
