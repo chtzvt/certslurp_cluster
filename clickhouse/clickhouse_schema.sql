@@ -30,10 +30,7 @@ dict_tech_patterns (HASHED dictionary) ←── tiny, versioned       │
 
 Org clustering, autocomplete & aliasing:
 
-    mv_org_roots (periodic refresh)
-    │
-    ▼
-    org_roots → org_root_sets (periodic refresh)
+    org_root_sets (periodic refresh)
     │
     └─→ org_alias_map (periodic refresh)
     └─→ org_autocomplete_clustered (periodic refresh)
@@ -59,44 +56,40 @@ ________________________________________________________________________
  - One row per (org_id, certificate)
  - Avoids arrayJoin at query time for exact org lookups.
 
-5. org_roots  (AggregatingMergeTree)
- - Pre-deduped list of registrable domains for each org_id
+4. org_root_sets  (periodically refreshed MergeTree)
+ - Most recent root domain set per org_id (one row per org)
  - Drives org_root_sets, which feeds alias clustering.
  - Refreshed automatically; do not manually insert.
 
-6. org_root_sets  (periodically refreshed MergeTree)
- - Most recent root domain set per org_id (one row per org)
- - Refreshed automatically; do not manually insert.
-
-7. org_alias_map  (periodically refreshed MergeTree)
+5. org_alias_map  (periodically refreshed MergeTree)
  - All pairs of org_ids sharing ≥2 registrable roots
  - Used for alias/cluster detection and autocomplete grouping.
 
-8. org_autocomplete_clustered  (periodically refreshed MergeTree)
+6. org_autocomplete_clustered  (periodically refreshed MergeTree)
  - Autocomplete table: cluster_id, aliases, display_name, cert_count
  - Used for fuzzy org lookup, UI, reporting.
 
-9. tech_patterns/dict_tech_patterns/dict_regex_prefixes
+7. tech_patterns/dict_tech_patterns/dict_regex_prefixes
  - Editable patterns and live-reload dictionaries for token/regex → tech mapping.
 
-10. tech_signals  (ReplacingMergeTree)
+8. tech_signals  (ReplacingMergeTree)
  - All technology "signals" (from heuristics + external sources)
  - Evidence, source, confidence, is_negative fields
  - Very robust deduplication logic
  - Continuously refreshed by mv_ct_tech_signals
 
-11. mv_ct_tech_signals
+9. mv_ct_tech_signals
  - Insert tech_signals from token and regex matches in mv_dns_flat.
  - Refreshes on schedule
 
-12. mv_org_tech / org_tech_facts (AggregatingMergeTree/view)
+10. mv_org_tech / org_tech_facts (AggregatingMergeTree/view)
  - One row per (org_id, tech); highest-confidence, deduped
  - API and reporting table
 
-13. etl_ingest_metrics
+11. etl_ingest_metrics
  - All ETL/ingest job runs (row count, duration, errors, partition, etc.)
 
-14. mv_partition_stats, slow_queries
+12. mv_partition_stats, slow_queries
  - System-level metrics and performance diagnostics
 
 ________________________________________________________________________
@@ -279,10 +272,11 @@ ORDER BY cert_count DESC;
 SELECT
     c.display_name,
     r.org_id,
-    length(r.roots) AS roots_count
-FROM org_roots AS r
+    count() AS roots_count
+FROM org_root_sets AS r
 LEFT JOIN org_autocomplete_clustered AS c
     ON r.org_id = c.cluster_id
+GROUP BY r.org_id, c.display_name
 ORDER BY roots_count DESC
 LIMIT 10;
 
@@ -624,7 +618,7 @@ CREATE OR REPLACE FUNCTION norm_token_key_filter_stopwords AS
     x -> length(x) > min_len AND NOT x IN (
       'inc','incorporated','llc','co','company','corp','corporation','ltd','limited','sa','gmbh',
       'the','and','&','-','of','pvt','llp','bv','spa','as','oy','aps','ab','sarl','nv','ag','sl',
-      'sas','kg','kgaa','pte','plc','ltda','sl','pty','srl','at','for','se','sp','com','www',
+      'sas','kg','kgaa','pte','plc','ltda','sl','pty','srl','at','for','se','sp','com','www','nv','amba',
       'gesellschaft','societe','société','empresa','firma','compania','compañía','compania','associés','vereniging',
       'de','del'
     ),
@@ -889,7 +883,9 @@ CREATE TABLE dns_flat
 )
 ENGINE = ReplacingMergeTree(lts)
 PARTITION BY toYYYYMM(lts)
-ORDER BY (country, registrable, root, dn);
+ORDER BY (country, registrable, root, dn)
+SETTINGS index_granularity = 8192,
+         min_bytes_for_wide_part = 134217728;
 
 DROP VIEW IF EXISTS mv_dns_flat;
 CREATE MATERIALIZED VIEW mv_dns_flat
@@ -934,69 +930,40 @@ WHERE org != '';
 /*-----------------------------------------------------------------------
   4.  Org → registrable-domain roll-up
 -----------------------------------------------------------------------*/
-/* 
-   Accumulates all historical aggregates for each org_id (potentially multiple versions).
-
-   This table is automatically maintained by mv_org_roots.
-   Do not manually write to this table, it will refresh on a schedule. */
-CREATE TABLE IF NOT EXISTS org_roots
-(
-    org_id UInt64,
-    roots Array(String),
-    root_cnt UInt64,
-    min_nbf DateTime64(0, 'UTC'),
-    max_naf DateTime64(0, 'UTC'),
-    min_lts DateTime64(6, 'UTC'),
-    max_lts DateTime64(6, 'UTC')
-)
-ENGINE = AggregatingMergeTree
-PARTITION BY toYYYYMM(min_lts)
-ORDER BY (org_id);
-
-DROP VIEW IF EXISTS mv_org_roots;
-CREATE MATERIALIZED VIEW mv_org_roots
-REFRESH EVERY 1 DAY OFFSET 1 HOUR RANDOMIZE FOR 1 HOUR
-TO org_roots AS
-SELECT
-    org_id(organization) AS org_id,
-    groupUniqArray(registrable) AS roots,
-    countDistinct(registrable) AS root_cnt,
-    min(nbf) AS min_nbf,
-    max(nbf) AS max_naf,
-    min(lts) AS min_lts,
-    max(lts) AS max_lts
-FROM dns_flat
-GROUP BY org_id;
-
 /*
    Stores only the latest, deduplicated snapshot of roots per org_id.
 
+   If you'd like to filter "super-issuers" in your query, you can do so (example):
+
+   WHERE a.org_id IN (SELECT org_id FROM (SELECT org_id, count() AS c FROM org_root_sets GROUP BY org_id HAVING c < 10000))
+     AND b.org_id IN (SELECT org_id FROM (SELECT org_id, count() AS c FROM org_root_sets GROUP BY org_id HAVING c < 10000))
+
    This table is automatically maintained by org_root_sets_mv.
    Do not manually write to this table, it will refresh on a schedule. */
-CREATE OR REPLACE TABLE org_root_sets
-(
-    org_id    UInt64,
-    roots     Array(String),
-    root_cnt  UInt64
+CREATE OR REPLACE TABLE org_root_sets (
+    org_id      UInt64,
+    registrable String,
+    min_nbf     DateTime64(0, 'UTC'),
+    min_lts     DateTime64(6, 'UTC'),
+    max_lts     DateTime64(6, 'UTC'),
+
+    INDEX idx_org_registrable (org_id, registrable) TYPE set(0) GRANULARITY 1
 )
 ENGINE = MergeTree
-ORDER BY org_id;
+ORDER BY (org_id, registrable);
 
 DROP VIEW IF EXISTS org_root_sets_mv;
-
 CREATE MATERIALIZED VIEW org_root_sets_mv
 REFRESH EVERY 1 DAY OFFSET 3 HOUR RANDOMIZE FOR 1 HOUR
 TO org_root_sets AS
 SELECT
     org_id,
-    roots,
-    length(roots) AS root_cnt
-FROM (
-    SELECT *,
-        row_number() OVER (PARTITION BY org_id ORDER BY min_nbf DESC) AS rn
-    FROM org_roots
-)
-WHERE rn = 1;
+    registrable,
+    min(nbf) AS min_nbf,
+    min(lts) AS min_lts,
+    max(lts) AS max_lts
+FROM dns_flat
+GROUP BY org_id, registrable;
 
 /*-----------------------------------------------------------------------
   5.  Organization SipHash signatures + autocomplete (fuzzy backbone)
@@ -1005,30 +972,57 @@ WHERE rn = 1;
 /* This table is automatically maintained by org_alias_map_mv.
    Do not manually write to this table, it will refresh on a schedule. */
 CREATE OR REPLACE TABLE org_alias_map
-ENGINE = MergeTree
-ORDER BY (alias_id, canonical_id) AS
-SELECT
-    a.org_id                                  AS alias_id,
-    b.org_id                                  AS canonical_id,
-    arrayIntersect(a.roots, b.roots)          AS shared,
-    length(shared)                            AS inter_cnt,
-    length(arrayUnion(a.roots, b.roots))      AS uni_cnt
-FROM org_root_sets a
-JOIN org_root_sets b ON a.org_id < b.org_id
-WHERE length(arrayIntersect(a.roots, b.roots)) >= 2;
+(
+    alias_id     UInt64,
+    canonical_id UInt64,
+    shared       Array(String),
+    inter_cnt    UInt64,
+    uni_cnt      UInt64,
 
+    INDEX idx_alias_id (alias_id) TYPE set(0) GRANULARITY 1,
+    INDEX idx_canonical_id (canonical_id) TYPE set(0) GRANULARITY 1
+)
+ENGINE = MergeTree
+ORDER BY (alias_id, canonical_id);
+
+-- p_by_alias_id:
+-- Projection to accelerate lookups of all canonical_id clusters for a given alias_id.
+-- Optimizes queries that retrieve all clusters or shared registrables associated with a particular alias_id.
+ALTER TABLE org_alias_map
+ADD PROJECTION IF NOT EXISTS p_by_alias_id
+(
+    SELECT canonical_id, shared, inter_cnt, uni_cnt
+    GROUP BY canonical_id, alias_id, shared, inter_cnt, uni_cnt
+);
+
+-- p_root_counts:
+-- Projection to efficiently compute the number of alias entries per alias_id (cluster size).
+-- Optimizes "top-N largest clusters" and fast alias_id cardinality queries.
+ALTER TABLE org_alias_map
+ADD PROJECTION IF NOT EXISTS p_root_counts
+(
+    SELECT alias_id, count() AS alias_count
+    GROUP BY alias_id
+);
+
+DROP VIEW IF EXISTS org_alias_map_mv;
 CREATE MATERIALIZED VIEW org_alias_map_mv
 REFRESH EVERY 1 DAY OFFSET 5 HOUR RANDOMIZE FOR 1 HOUR
 TO org_alias_map AS
 SELECT
-    a.org_id                                  AS alias_id,
-    b.org_id                                  AS canonical_id,
-    arrayIntersect(a.roots, b.roots)          AS shared,
-    length(shared)                            AS inter_cnt,
-    length(arrayUnion(a.roots, b.roots))      AS uni_cnt
+    a.org_id                          AS alias_id,
+    b.org_id                          AS canonical_id,
+    groupArrayDistinct(a.registrable) AS shared,
+    count()                           AS inter_cnt,
+    uniqExact(arrayConcat([a.registrable], [b.registrable])) AS uni_cnt
 FROM org_root_sets a
-JOIN org_root_sets b ON a.org_id < b.org_id
-WHERE length(shared) >= 2;
+JOIN org_root_sets b
+    ON a.registrable = b.registrable AND a.org_id < b.org_id
+-- Prevent accidental aliasing to large issuers (e.g. "Acme Corp" should not get aliased/clustered with Cloudflare just because they host a lot of infra there)
+WHERE a.org_id IN (SELECT org_id FROM (SELECT org_id, count() AS c FROM org_root_sets GROUP BY org_id HAVING c < 10000))
+  AND b.org_id IN (SELECT org_id FROM (SELECT org_id, count() AS c FROM org_root_sets GROUP BY org_id HAVING c < 10000))
+GROUP BY alias_id, canonical_id
+HAVING inter_cnt >= 2;
 
 /* This table is automatically maintained by org_autocomplete_clustered_mv.
    Do not manually write to this table, it will refresh on a schedule. */
@@ -1046,7 +1040,9 @@ CREATE TABLE org_autocomplete_clustered
 )
 ENGINE = MergeTree
 ORDER BY (cert_count DESC, display_name)
-SETTINGS index_granularity = 8192, allow_experimental_reverse_key = 1;
+SETTINGS 
+    index_granularity = 8192, 
+    allow_experimental_reverse_key = 1;
 
 CREATE MATERIALIZED VIEW org_autocomplete_clustered_mv
 REFRESH EVERY 1 DAY OFFSET 7 HOUR RANDOMIZE FOR 1 HOUR
@@ -1174,7 +1170,10 @@ CREATE TABLE IF NOT EXISTS tech_signals
 )
 ENGINE = ReplacingMergeTree(ts)
 PARTITION BY toYYYYMM(ts)
-ORDER BY (org_id, tech, evidence_id);
+ORDER BY (org_id, tech, evidence_id)
+SETTINGS 
+    index_granularity = 8192,
+    min_bytes_for_wide_part = 134217728;
 
 /* 6.3  CT-driven heuristic signals */
 DROP VIEW IF EXISTS mv_ct_tech_signals;
