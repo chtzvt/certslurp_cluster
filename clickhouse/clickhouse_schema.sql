@@ -215,11 +215,47 @@ ORDER BY f.last_seen DESC
 LIMIT 50;
 
 * Growth of .bitbucket registrable domains in DE:
-SELECT toStartOfMonth(nbf) AS month,
-uniqExact(registrable) AS n
-FROM dns_flat
-WHERE country='DE' AND dn ILIKE '%bitbucket%'
-GROUP BY month ORDER BY month;
+
+WITH
+first_seen AS (
+    SELECT
+        toStartOfMonth(min(lts)) AS month,
+        dn
+    FROM dns_flat
+    WHERE (country = 'DE' OR tld = 'de')
+      AND NOT wildcard
+      AND depth >= 3
+      AND dn ILIKE '%bitbucket%'
+    GROUP BY dn
+),
+last_seen AS (
+    SELECT
+        toStartOfMonth(max(lts)) AS month,
+        dn
+    FROM dns_flat
+    WHERE (country = 'DE' OR tld = 'de')
+      AND NOT wildcard
+      AND depth >= 3
+      AND dn ILIKE '%bitbucket%'
+    GROUP BY dn
+)
+SELECT
+    months.month,
+    countDistinct(first_seen.dn) AS new_dns, -- Domains first seen that month
+    countDistinct(last_seen.dn) AS disappeared_dns, -- Domains last seen that month
+    sum(new_dns) OVER (ORDER BY month ASC) AS cumulative, -- Running total (sum of new domains over time)
+    sum(new_dns) OVER (ORDER BY month ASC) - sum(disappeared_dns) OVER (ORDER BY month ASC) AS population, -- Net population
+    runningDifference(cast(sum(new_dns) OVER (ORDER BY month ASC), 'Int64')) AS net_growth, -- Month-over-month change in total domains
+    runningDifference(cast(sum(disappeared_dns) OVER (ORDER BY month ASC), 'Int64')) AS net_attrition -- Month-over-month change in attrition (disappearing domains)
+FROM (
+    SELECT month FROM first_seen
+    UNION
+    SELECT month FROM last_seen
+) AS months
+LEFT JOIN first_seen ON months.month = first_seen.month
+LEFT JOIN last_seen ON months.month = last_seen.month
+GROUP BY months.month
+ORDER BY months.month ASC
 
 * Recent ETL job runs and durations:
 SELECT * FROM etl_ingest_metrics
