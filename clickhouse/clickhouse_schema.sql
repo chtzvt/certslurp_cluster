@@ -203,22 +203,20 @@ WHERE dn = 'githubcopilot-prod-106135.jpmchase.com'
 ORDER BY lts DESC
 LIMIT 1
 
-* Which orgs appear to run GitLab in DE + CH?
+* Which orgs appear to run GitLab in DACH?
 SELECT
     o.display_name,
     f.confidence,
     f.last_seen
 FROM org_tech_facts AS f
 INNER JOIN org_autocomplete_clustered AS o ON f.org_id = o.cluster_id
-WHERE f.tech = 'GitLab'
-  AND f.confidence >= 0.5
-  AND f.org_id IN (
-        SELECT org_id
-        FROM org_locations
-        WHERE country IN ('de', 'ch')
-    )
+WHERE (f.tech = 'GitLab') AND (f.confidence >= 0.5) AND (f.org_id IN (
+    SELECT org_id
+    FROM org_locations
+    WHERE country IN ('de', 'ch', 'at')
+))
 ORDER BY f.last_seen DESC
-LIMIT 50;
+LIMIT 100;
 
 * Growth of .bitbucket registrable domains in DE:
 WITH
