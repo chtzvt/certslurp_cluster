@@ -92,6 +92,10 @@ ________________________________________________________________________
 12. mv_partition_stats, slow_queries
  - System-level metrics and performance diagnostics
 
+13. org_locations
+ - 1 row per country/province/locality/org ID
+ - Simplifies organization lookup by geographical location
+ - Note that all fields are lowercased
 ________________________________________________________________________
 CLUSTERING & QUERYING ORGANIZATIONS
 ________________________________________________________________________
@@ -196,7 +200,7 @@ SELECT *
 FROM dns_flat
 WHERE dn = 'githubcopilot-prod-106135.jpmchase.com'
   AND org_id = org_id('JPMorgan Chase')
-ORDER BY ts DESC
+ORDER BY lts DESC
 LIMIT 1
 
 * Which orgs appear to run GitLab in DE + CH?
@@ -206,23 +210,29 @@ SELECT
     f.last_seen
 FROM org_tech_facts AS f
 INNER JOIN org_autocomplete_clustered AS o ON f.org_id = o.cluster_id
-WHERE (f.tech = 'GitLab') AND (f.confidence >= 0.5) AND (f.org_id IN (
-    SELECT org_id
-    FROM dns_flat
-    WHERE country IN ('DE', 'CH')
-))
+WHERE f.tech = 'GitLab'
+  AND f.confidence >= 0.5
+  AND f.org_id IN (
+        SELECT org_id
+        FROM org_locations
+        WHERE country IN ('de', 'ch')
+    )
 ORDER BY f.last_seen DESC
 LIMIT 50;
 
 * Growth of .bitbucket registrable domains in DE:
-
 WITH
+orgs_in_de AS (
+    SELECT DISTINCT org_id
+    FROM org_locations
+    WHERE country = 'de'
+),
 first_seen AS (
     SELECT
         toStartOfMonth(min(lts)) AS month,
         dn
     FROM dns_flat
-    WHERE (country = 'DE' OR tld = 'de')
+    WHERE org_id IN (SELECT org_id FROM orgs_in_de)
       AND NOT wildcard
       AND depth >= 3
       AND dn ILIKE '%bitbucket%'
@@ -233,7 +243,7 @@ last_seen AS (
         toStartOfMonth(max(lts)) AS month,
         dn
     FROM dns_flat
-    WHERE (country = 'DE' OR tld = 'de')
+    WHERE org_id IN (SELECT org_id FROM orgs_in_de)
       AND NOT wildcard
       AND depth >= 3
       AND dn ILIKE '%bitbucket%'
@@ -241,12 +251,12 @@ last_seen AS (
 )
 SELECT
     months.month,
-    countDistinct(first_seen.dn) AS new_dns, -- Domains first seen that month
-    countDistinct(last_seen.dn) AS disappeared_dns, -- Domains last seen that month
-    sum(new_dns) OVER (ORDER BY month ASC) AS cumulative, -- Running total (sum of new domains over time)
-    sum(new_dns) OVER (ORDER BY month ASC) - sum(disappeared_dns) OVER (ORDER BY month ASC) AS population, -- Net population
-    runningDifference(cast(sum(new_dns) OVER (ORDER BY month ASC), 'Int64')) AS net_growth, -- Month-over-month change in total domains
-    runningDifference(cast(sum(disappeared_dns) OVER (ORDER BY month ASC), 'Int64')) AS net_attrition -- Month-over-month change in attrition (disappearing domains)
+    countDistinct(first_seen.dn) AS new_dns,
+    countDistinct(last_seen.dn) AS disappeared_dns,
+    sum(new_dns) OVER (ORDER BY month ASC) AS cumulative,
+    sum(new_dns) OVER (ORDER BY month ASC) - sum(disappeared_dns) OVER (ORDER BY month ASC) AS population,
+    runningDifference(cast(sum(new_dns) OVER (ORDER BY month ASC), 'Int64')) AS net_growth,
+    runningDifference(cast(sum(disappeared_dns) OVER (ORDER BY month ASC), 'Int64')) AS net_attrition
 FROM (
     SELECT month FROM first_seen
     UNION
@@ -255,7 +265,7 @@ FROM (
 LEFT JOIN first_seen ON months.month = first_seen.month
 LEFT JOIN last_seen ON months.month = last_seen.month
 GROUP BY months.month
-ORDER BY months.month ASC
+ORDER BY months.month ASC;
 
 * Recent ETL job runs and durations:
 SELECT * FROM etl_ingest_metrics
@@ -946,7 +956,7 @@ SELECT
 FROM ct_certificates;
 
 /*-----------------------------------------------------------------------
-  3.  Org → certificate lookup view
+  3.  Org -> certificate and org -> country lookup views
 -----------------------------------------------------------------------*/
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_org_cert
 ENGINE = MergeTree
@@ -962,6 +972,34 @@ SELECT
 FROM ct_certificates
 ARRAY JOIN org
 WHERE org != '';
+
+CREATE OR REPLACE TABLE org_locations
+(
+    org_id   UInt64,
+    country  LowCardinality(String),
+    province String,
+    locality String,
+    tld      LowCardinality(String),
+
+    INDEX idx_org_id (org_id) TYPE set(0) GRANULARITY 1,
+    INDEX idx_tld (tld) TYPE set(0) GRANULARITY 1
+)
+ENGINE = MergeTree
+ORDER BY (country, province, locality, tld, org_id);
+
+DROP VIEW IF EXISTS mv_org_locations;
+CREATE MATERIALIZED VIEW mv_org_locations
+REFRESH EVERY 1 DAY OFFSET 4 HOUR RANDOMIZE FOR 1 HOUR
+TO org_locations AS
+SELECT
+    org_id,
+    lowerUTF8(country) AS country,
+    lowerUTF8(province) AS province,
+    lowerUTF8(locality) AS locality,
+    lowerUTF8(tld) AS tld
+FROM dns_flat
+WHERE country != ''
+GROUP BY org_id, country, province, locality, tld;
 
 /*-----------------------------------------------------------------------
   4.  Org → registrable-domain roll-up
