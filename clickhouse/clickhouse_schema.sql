@@ -10,7 +10,7 @@ ________________________________________________________________________
 DATA FLOW & ARCHITECTURE
 ________________________________________________________________________
 
-CT logs → certslurp archives → ct_certificates
+CT logs -> certslurp archives -> ct_certificates
                         │
         ┌───────────────┴────────────────────────────────────────┐
         │   [mv_dns_flat] (per-SAN)                              │
@@ -18,7 +18,7 @@ CT logs → certslurp archives → ct_certificates
 dict_tech_patterns (HASHED dictionary) ←── tiny, versioned       │
         │                                                        ▼
         ▼                                           [pattern/token/regex match]
- [mv_ct_tech_signals] ─────────────────────────────────────→ tech_signals ←── external scan/API
+ [mv_ct_tech_signals] ─────────────────────────────────────-> tech_signals ←── external scan/API
         ▲                                                        ▲
         │                                                        │ merges & suppression
         │                                                        │
@@ -30,12 +30,18 @@ dict_tech_patterns (HASHED dictionary) ←── tiny, versioned       │
 
 Org clustering, autocomplete & aliasing:
 
-    org_root_sets (periodic refresh)
-    │
-    └─→ org_alias_map (periodic refresh)
-    └─→ org_autocomplete_clustered (periodic refresh)
+org_root_sets (periodic refresh, de-noised ownership)
+│
+├─→ org_alias_map (periodic refresh, alias cluster detection)
+└─→ org_autocomplete_clustered (periodic refresh, fuzzy search clusters)
 
-All organizational grouping uses org_id (UInt64; deterministic SipHash64 of normalized tokens) for speed and deduplication.
+All organizational grouping uses org_id (UInt64; deterministic SipHash64 of normalized organization tokens) for high-speed lookup and lossless deduplication.
+De-noising (ownership filtering) is applied in org_root_sets_mv; all downstream clustering depends on these filters to exclude infrastructure, super-issuers, and SaaS/hosting providers.
+
+Key tunable params:
+ - Diversity threshold (registrable_count > 1000)
+ - Domain depth filter (min_depth; usually <=2)
+ - Explicit denylist/canonical owner overrides
 
 ________________________________________________________________________
 TABLE & VIEW GLOSSARY
@@ -57,20 +63,26 @@ ________________________________________________________________________
  - Avoids arrayJoin at query time for exact org lookups.
 
 4. org_root_sets  (periodically refreshed MergeTree)
- - Most recent root domain set per org_id (one row per org)
- - Drives org_root_sets, which feeds alias clustering.
- - Refreshed automatically; do not manually insert.
+ - Snapshot of de-noised “true” org_id <-> registrable relationships (one row per (org_id, registrable)).
+ - Result of applying infra/denylist and org diversity (super-issuer) filters, and min domain depth logic.
+ - Columns flag canonical ownership and allow/disallow aliasing/merging.
+ - Refreshed automatically by org_root_sets_mv; do not manually insert or update.
+Tunable parameters: org_diversity_signal threshold, denylist, canonical overrides.
 
 5. org_alias_map  (periodically refreshed MergeTree)
- - All pairs of org_ids sharing ≥2 registrable roots
- - Used for alias/cluster detection and autocomplete grouping.
+ - All pairs of org_ids sharing >=N registrable roots (default: N=5), where both are allowed to be aliased.
+ - Used for alias cluster detection and autocomplete grouping.
+ - Excludes infra orgs, super-issuers, and noisy relationships by using org_root_sets as its source.
+ - Fast graph view of plausible org merges for UI, search, and clustering.
 
 6. org_autocomplete_clustered  (periodically refreshed MergeTree)
- - Autocomplete table: cluster_id, aliases, display_name, cert_count
- - Used for fuzzy org lookup, UI, reporting.
+ - Autocomplete index and search clusters for organizations.
+ - Each row represents an alias cluster (cluster_id), with display name, list of aliases, and cert count.
+ - Used for fuzzy org lookup, search UI, and reporting.
+ - Automatically deduplicated and grouped via alias mapping; updated on schedule.
 
 7. tech_patterns/dict_tech_patterns/dict_regex_prefixes
- - Editable patterns and live-reload dictionaries for token/regex → tech mapping.
+ - Editable patterns and live-reload dictionaries for token/regex -> tech mapping.
 
 8. tech_signals  (ReplacingMergeTree)
  - All technology "signals" (from heuristics + external sources)
@@ -127,7 +139,60 @@ Workflow to resolve user input:
 
 This abstraction removes the need for manual alias expansion or fan-out in queries.
 
-==========================================================================
+________________________________________________________________________
+De-noising Organization "Ownership" in CT Domain Data
+________________________________________________________________________
+
+Problem:
+- Not every organization listed on a certificate is the true owner
+  of a domain. Infra providers, SaaS vendors, CDNs, and super-issuers
+  (e.g., CAs, hosting platforms) create significant noise in org→domain
+  mappings extracted from CT logs.
+
+Approach:
+
+We combine two complementary heuristics to infer "true" organizational
+ownership of registrable domains, and to reduce false positives:
+
+1. Org Diversity Filter ("Super-Issuer" Suppression)
+  - Track how many distinct registrables each org_id appears on.
+  - Orgs with abnormally high diversity (e.g., >1000 registrables)
+    are flagged as "infra" and downranked or excluded as owners.
+  - The diversity threshold is tunable in org_diversity_signal.
+
+2. Domain Depth Heuristic ("Proximity to the Root")
+  - For each (org_id, registrable) pair, record the minimum depth of
+    domain names associated with that org on certificates.
+  - Orgs with only deep subdomain coverage (e.g., analytics.example.com)
+    but never for the registrable itself (example.com) are likely not
+    true owners—these are downranked or filtered out.
+  - The maximum allowed depth is tunable (usually 2 or 3).
+
+Implementation:
+  - For each (org_id, registrable), retain only those where the org
+    is not "infra" (fails org diversity or explicit denylist), or is the
+    canonical owner via manual override.
+  - Only merge/alias orgs if they clear these de-noising filters.
+
+Tunable parameters:
+  - org_diversity_signal.registrable_count threshold (default: 1000)
+  - max domain depth (set in downstream consumers or clustering logic)
+  - org_alias_denylist contents
+  - canonical override table
+
+TL;DR Heuristic:
+  - True owner: Org certifies apex/1st-level domains, and appears for
+    relatively few registrables overall.
+  - Infra: Org appears on many registrables, and typically only deep
+    subdomains.
+
+Example owner score:
+  owner_score = log(cert_count + 1) / (min_depth + 1) / log(registrable_diversity + 2)
+
+This logic is implemented in org_root_sets_mv and related tables.
+For best results, periodically review threshold settings and sample
+output to ensure continued signal quality.
+
 ________________________________________________________________________
 TYPICAL QUERY PATTERNS
 ________________________________________________________________________
@@ -1000,21 +1065,185 @@ WHERE country != ''
 GROUP BY org_id, country, province, locality, tld;
 
 /*-----------------------------------------------------------------------
-  4.  Org → registrable-domain roll-up
+  4.  Org -> registrable-domain roll-up
 -----------------------------------------------------------------------*/
 /*
-   Stores only the latest, deduplicated snapshot of roots per org_id.
+   This table is automatically maintained by org_diversity_signal_mv.
+   Do not manually write to this table, it will refresh on a schedule.
 
-   If you'd like to filter "super-issuers" in your query, you can do so (example):
+Threshold tuning queries:
 
-   WHERE a.org_id IN (SELECT org_id FROM (SELECT org_id, count() AS c FROM org_root_sets GROUP BY org_id HAVING c < 10000))
-     AND b.org_id IN (SELECT org_id FROM (SELECT org_id, count() AS c FROM org_root_sets GROUP BY org_id HAVING c < 10000))
+-- Drill down into orgs associated with a single registrable:
+SELECT
+    org_id,
+    min(depth) AS min_depth,
+    count() AS n,
+    any(organization) AS org_name
+FROM dns_flat
+WHERE registrable = 'nba.com'
+GROUP BY org_id
+ORDER BY
+    min_depth ASC,
+    n DESC
+LIMIT 10
 
-   This table is automatically maintained by org_root_sets_mv.
-   Do not manually write to this table, it will refresh on a schedule. */
+-- Overall spread and a few key stats:
+SELECT
+    quantile(0.5)(registrable_count) AS median,
+    quantile(0.9)(registrable_count) AS p90,
+    quantile(0.95)(registrable_count) AS p95,
+    quantile(0.99)(registrable_count) AS p99,
+    max(registrable_count) AS max_count,
+    count() AS orgs_total
+FROM org_diversity_signal;
+
+-- Orgs with the highest registrable diversity:
+SELECT
+    org_id,
+    org_name,
+    registrable_count
+FROM org_diversity_signal
+ORDER BY registrable_count DESC
+LIMIT 50;
+
+-- Bucketed:
+SELECT
+    intDiv(registrable_count, 10) * 10 AS bucket,
+    count() AS orgs_in_bucket
+FROM org_diversity_signal
+GROUP BY bucket
+ORDER BY bucket;
+
+-- Check who is just above and just below a candidate threshold:
+SELECT org_id, org_name, registrable_count
+FROM org_diversity_signal
+WHERE registrable_count BETWEEN 900 AND 21473440
+ORDER BY registrable_count DESC;
+*/
+CREATE OR REPLACE TABLE org_diversity_signal (
+    org_id             UInt64,
+    registrable_count  UInt64,
+    min_depth          UInt8,
+    org_name           String
+)
+ENGINE = MergeTree
+ORDER BY org_id;
+
+DROP VIEW IF EXISTS org_diversity_signal_mv;
+CREATE MATERIALIZED VIEW org_diversity_signal_mv
+REFRESH EVERY 1 DAY OFFSET 2 HOUR RANDOMIZE FOR 1 HOUR
+TO org_diversity_signal AS
+SELECT
+    org_id,
+    countDistinct(registrable) AS registrable_count,
+    min(depth) AS min_depth,
+    any(organization) AS org_name
+FROM dns_flat
+GROUP BY org_id
+ORDER BY registrable_count DESC;
+
+/*
+  org_alias_denylist
+
+  Table of organization IDs (org_id) that are explicitly *disallowed* from
+  being considered as canonical or alias owners of registrables.
+  Used to block infra, CDN, proxy, and other "unmergeable" orgs from
+  being aggregated or aliased.
+
+  - org_id:   Unique organization signature (UInt64 hash, never null).
+  - org_name: Display name for reference.
+
+  Notes:
+    - Only a small, highly curated set of orgs should be in this table.
+    - Maintain via explicit governance—mistakes can break canonical logic.
+    - Write changes atomically if possible.
+*/
+CREATE OR REPLACE TABLE org_alias_denylist (
+    org_id   UInt64,
+    org_name String
+)
+ENGINE = TinyLog;
+
+/*
+  dict_org_alias_denylist
+
+  Dictionary view of org_alias_denylist, for ultra-fast lookup from SQL.
+  Used to check in queries and materialized views if an org is "denylisted".
+
+  - PRIMARY KEY: org_id
+  - Source:      org_alias_denylist table
+
+  Tunable:
+    - LIFETIME: How often the dictionary refreshes (300–3600 seconds).
+                Lower = fresher updates, higher = less overhead.
+*/
+DROP DICTIONARY IF EXISTS dict_org_alias_denylist;
+CREATE DICTIONARY dict_org_alias_denylist
+(
+    org_id   UInt64,
+    org_name String
+)
+PRIMARY KEY org_id
+SOURCE(CLICKHOUSE(TABLE 'org_alias_denylist'))
+LAYOUT(HASHED())
+LIFETIME(MIN 300 MAX 3600);
+
+
+/*
+  registrable_canonical_override
+
+  Table of manual overrides mapping registrable domains to their *canonical*
+  organizational owner. Used to fix cases where the default org_id logic
+  is insufficient (e.g. mergers, legal parent/child relationships, etc).
+
+  - registrable:  Domain name (e.g., 'example.com').
+  - org_id:       Canonical owner org_id for this registrable.
+  - owner_name:   Display name for reference.
+
+  Notes:
+    - Use only for true overrides—avoid overuse.
+    - Always keep entries deduplicated and current.
+*/
+CREATE OR REPLACE TABLE registrable_canonical_override (
+    registrable  String,
+    org_id       UInt64,
+    owner_name   String
+)
+ENGINE = TinyLog;
+
+/*
+  org_root_sets
+
+  This table is automatically maintained by org_root_sets_mv.
+  Do not manually write to this table, it will refresh on a schedule.
+
+  Roll-up table that links each org_id to its associated registrables,
+  with computed signals for canonical ownership, infra status, and
+  aliasing policy. This is the definitive record for whether an org
+  can be considered the "owner" or "alias" for a domain.
+
+  - org_id:             Unique organization signature (UInt64 hash).
+  - registrable:        Registrable domain (e.g., 'example.com').
+  - is_canonical_owner: True if org is canonical owner of the registrable.
+  - is_infra_org:       True if org is infra (denylist/diversity).
+  - allow_aliasing:     True if org can participate in alias/cluster logic.
+  - min_nbf, min_lts, max_lts: Date boundaries for the relationship.
+
+  Maintained by: org_root_sets_mv materialized view.
+
+  Important:
+    - Do not manually write to this table.
+    - The business logic (diversity threshold, denylist, overrides)
+      is tunable in the underlying views/dictionaries.
+    - Tune diversity threshold and denylist as needed for your use case.
+*/
 CREATE OR REPLACE TABLE org_root_sets (
     org_id      UInt64,
     registrable String,
+    is_canonical_owner Bool,
+    is_infra_org Bool,
+    allow_aliasing Bool,
+    min_depth UInt8,
     min_nbf     DateTime64(0, 'UTC'),
     min_lts     DateTime64(6, 'UTC'),
     max_lts     DateTime64(6, 'UTC'),
@@ -1024,18 +1253,60 @@ CREATE OR REPLACE TABLE org_root_sets (
 ENGINE = MergeTree
 ORDER BY (org_id, registrable);
 
+/*
+  org_root_sets_mv
+
+  Materialized view that automatically maintains and refreshes the
+  org_root_sets table, rolling up all observed (org_id, registrable)
+  relationships from dns_flat and computing canonical ownership,
+  infra/denylist status, and aliasing eligibility.
+
+  Key logic:
+    - Canonical ownership is determined either by explicit override or
+      by the org_id's relationship to the registrable.
+    - Infra orgs are those appearing in the denylist *or* surpassing the
+      org diversity threshold (via org_diversity_signal).
+    - Aliasing is permitted only for non-infra orgs or the canonical owner.
+
+  Inputs:
+    - dns_flat: Source of organization->registrable relationships.
+    - org_diversity_signal: Diversity threshold for "infra" detection.
+    - org_alias_denylist: Explicit blocklist for infra orgs.
+    - registrable_canonical_override: Manual owner overrides.
+
+  Important tunables:
+    - Adjust org diversity threshold in org_diversity_signal as needed.
+    - Maintain org_alias_denylist and canonical overrides with care.
+*/
 DROP VIEW IF EXISTS org_root_sets_mv;
 CREATE MATERIALIZED VIEW org_root_sets_mv
 REFRESH EVERY 1 DAY OFFSET 3 HOUR RANDOMIZE FOR 1 HOUR
 TO org_root_sets AS
 SELECT
+    org_id(d.organization) AS org_id,
+    d.registrable AS registrable,
+    min(d.nbf) AS min_nbf,
+    min(d.lts) AS min_lts,
+    max(d.lts) AS max_lts,
+    min(d.depth) AS min_depth,
+    -- Is this org the canonical owner of this registrable?
+    max(co.org_id) = org_id(d.organization) AS is_canonical_owner,
+    -- Is it an infra org? (in denylist or hits org diversity threshold)
+    dictHas('dict_org_alias_denylist', org_id(d.organization)) 
+      OR (max(ds.org_id) != 0) AS is_infra_org,
+    -- Allow aliasing if NOT infra, or if canonical owner
+    (NOT is_infra_org OR is_canonical_owner) AS allow_aliasing
+FROM dns_flat AS d
+LEFT JOIN org_diversity_signal AS ds
+  ON (org_id(d.organization) = ds.org_id)
+  AND (ds.registrable_count > 1000)
+LEFT JOIN registrable_canonical_override AS co
+  ON (d.registrable = co.registrable)
+  AND (org_id(d.organization) = co.org_id)
+GROUP BY
     org_id,
-    registrable,
-    min(nbf) AS min_nbf,
-    min(lts) AS min_lts,
-    max(lts) AS max_lts
-FROM dns_flat
-GROUP BY org_id, registrable;
+    d.registrable;
+
 
 /*-----------------------------------------------------------------------
   5.  Organization SipHash signatures + autocomplete (fuzzy backbone)
@@ -1082,23 +1353,24 @@ CREATE MATERIALIZED VIEW org_alias_map_mv
 REFRESH EVERY 1 DAY OFFSET 5 HOUR RANDOMIZE FOR 1 HOUR
 TO org_alias_map AS
 SELECT
-    a.org_id                          AS alias_id,
-    b.org_id                          AS canonical_id,
+    a.org_id AS alias_id,
+    b.org_id AS canonical_id,
     groupArrayDistinct(a.registrable) AS shared,
-    count()                           AS inter_cnt,
+    count() AS inter_cnt,
     uniqExact(arrayConcat([a.registrable], [b.registrable])) AS uni_cnt
 FROM org_root_sets a
 JOIN org_root_sets b
-    ON a.registrable = b.registrable AND a.org_id < b.org_id
--- Prevent accidental aliasing to large issuers (e.g. "Acme Corp" should not get aliased/clustered with Cloudflare just because they host a lot of infra there)
-WHERE a.org_id IN (SELECT org_id FROM (SELECT org_id, count() AS c FROM org_root_sets GROUP BY org_id HAVING c < 10000))
-  AND b.org_id IN (SELECT org_id FROM (SELECT org_id, count() AS c FROM org_root_sets GROUP BY org_id HAVING c < 10000))
+    ON a.registrable = b.registrable
+    AND a.org_id < b.org_id
+WHERE a.allow_aliasing = 1
+  AND b.allow_aliasing = 1
 GROUP BY alias_id, canonical_id
-HAVING inter_cnt >= 2;
+HAVING min(a.min_depth) = 2 AND min(b.min_depth) = 2 AND inter_cnt >= 4;
+
 
 /* This table is automatically maintained by org_autocomplete_clustered_mv.
    Do not manually write to this table, it will refresh on a schedule. */
-CREATE TABLE org_autocomplete_clustered
+CREATE OR REPLACE TABLE org_autocomplete_clustered
 (
     cluster_id   UInt64,
     display_name String,
@@ -1116,6 +1388,7 @@ SETTINGS
     index_granularity = 8192, 
     allow_experimental_reverse_key = 1;
 
+DROP VIEW IF EXISTS org_autocomplete_clustered_mv;
 CREATE MATERIALIZED VIEW org_autocomplete_clustered_mv
 REFRESH EVERY 1 DAY OFFSET 7 HOUR RANDOMIZE FOR 1 HOUR
 TO org_autocomplete_clustered AS
@@ -1131,6 +1404,7 @@ FROM (
         count()                AS count
     FROM ct_certificates
     WHERE arrayJoin(org) != ''
+      AND NOT dictHas('dict_org_alias_denylist', org_id(arrayJoin(org)))
     GROUP BY org_id, organization
 ) AS c
 LEFT JOIN org_alias_map m ON c.org_id = m.alias_id
@@ -1388,3 +1662,47 @@ INSERT INTO tech_patterns (id, pattern, is_regex, regex_prefix, tech, weight)
 VALUES (9, '^([a-z0-9-]+\\.)+ghe\\.com$', 1, 'ghe.com', 'GitHub Enterprise Cloud (Data Residency)', 1.0);
 
 SYSTEM RELOAD DICTIONARY dict_tech_patterns;
+
+
+-- Populate org_alias_denylist
+WITH orgs AS (
+    SELECT arrayJoin([
+        'Microsoft Corporation',
+        'Cloudflare Inc',
+        'Edgio, Inc.',
+        'Edgecast Inc.',
+        'Incapsula Inc',
+        'Criteo Technology SAS',
+        'CRITEO SA',
+        'CDNETWORKS CO., LTD.',
+        'Shopify Inc.',
+        'Salesforce.com, Inc.',
+        'Adobe Systems Co., Ltd.',
+        'Firebase, Inc.',
+        'Verizon Digital Media Services Inc.',
+        'Kyndryl, Inc.',
+        'TIBCO Software Inc',
+        'Atanar Technologies'
+    ]) AS org_name
+)
+INSERT INTO org_alias_denylist
+SELECT
+    org_id(org_name) AS org_id,
+    org_name
+FROM orgs;
+
+SYSTEM RELOAD DICTIONARY dict_org_alias_denylist;
+
+-- Populate registrable_canonical_override
+WITH overrides AS (
+    SELECT
+        'nba.com' AS registrable, 'NBA Media Ventures, LLC' AS owner_name
+    UNION ALL
+    SELECT 'trutv.com', 'Warner Bros. Discovery, Inc.'
+)
+INSERT INTO registrable_canonical_override
+SELECT
+    registrable,
+    org_id(owner_name) AS org_id,
+    owner_name
+FROM overrides;
