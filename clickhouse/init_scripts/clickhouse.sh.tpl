@@ -101,6 +101,13 @@ cat >/etc/clickhouse-server/config.d/data_directories.xml <<EOF
 </yandex>
 EOF
 
+cat >/etc/clickhouse-server/config.d/listen_ports.xml <<EOF
+<yandex>
+  <listen_host>0.0.0.0</listen_host>
+</yandex>
+EOF
+
+
 # Configure clickhouse users
 cat >/etc/clickhouse-server/users.d/init_users.xml <<EOF
 <yandex>
@@ -124,7 +131,7 @@ cat >/etc/clickhouse-server/users.d/init_users.xml <<EOF
   </users>
   <profiles>
     <readonly>
-      <readonly>1</readonly>
+      <readonly>2</readonly>
       <allow_ddl>0</allow_ddl>
     </readonly>
   </profiles>
