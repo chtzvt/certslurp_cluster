@@ -37,6 +37,10 @@ FROM azureBlobStorage(
      'zstd',                                           -- compression
      'cn String,sub String,iss String,sn String,em Array(String),ou Array(String),org Array(String),loc Array(String),prv Array(String),co Array(String),st Array(String),pc Array(String),dns Array(String),ips Array(String),uris Array(String),nbf String,naf String,log String,li UInt64,lts UInt64'
 )
+
+-- Only records from 2024-01-01 onwards
+WHERE toDateTime64(lts/1000, 6, 'UTC') >= toDateTime64('2024-01-01 00:00:00', 6, 'UTC')
+
 SETTINGS
     -- split the JSONL stream every ~64 k rows
     max_block_size              = 65536,
