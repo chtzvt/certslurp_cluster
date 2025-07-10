@@ -1564,21 +1564,22 @@ CREATE TABLE IF NOT EXISTS tech_signals
     tech         LowCardinality(String),
     evidence     Array(Tuple(type String, value String)),
 
+    -- Latest metadata
+    ts           DateTime64(3, 'UTC'),
+    confidence   Float32,
+    source       LowCardinality(String), -- Conventional defaults: ct_heuristic, active_scan, proxycurl
+
     -- evidence_id: Uniquely identifies a normalized set of evidence for this detection.
     -- Computed as the SipHash64 of a string concatenation of all sorted evidence elements,
     -- where each element is type:value, array-sorted and joined with '\x1E' (ASCII record
     -- separator), e.g.: [('dns','foo.com'),('asn','123')] -> sipHash64('asn:123\x1Edns:foo.com')
     -- Ensures deduplication even if array order differs.
     evidence_id UInt64 MATERIALIZED
-        sipHash64(arrayStringConcat(
+        sipHash64(concat(arrayStringConcat(
             arrayMap(x -> concat(x.1, ':', x.2), arraySort(arrayDistinct(evidence))),
             '\x1E'
-        )),
+        ), source)),
 
-    -- Latest metadata
-    ts           DateTime64(3, 'UTC'),
-    confidence   Float32,
-    source       LowCardinality(String), -- Conventional defaults: ct_heuristic, active_scan, proxycurl
     state        Enum8(
         'active' = 1,
         'suppressed' = 2,
@@ -1603,7 +1604,7 @@ REFRESH EVERY 1 DAY OFFSET 6 HOUR RANDOMIZE FOR 1 HOUR
 TO tech_signals AS
 -- pattern match (dict_tech_patterns)
 SELECT
-    now64()                       AS ts,
+    df.lts                        AS ts,
     df.org_id                     AS org_id,
     df.registrable                AS registrable,
     tp.tech                       AS tech,
@@ -1628,7 +1629,7 @@ WHERE arrayExists(
 UNION ALL
 -- regex match (dict_regex_prefixes)
 SELECT
-    now64()                 AS ts,
+    df.lts                  AS ts,
     df.org_id               AS org_id,
     df.registrable          AS registrable,
     rp.tech                 AS tech,
