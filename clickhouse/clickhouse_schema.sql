@@ -635,6 +635,14 @@ SELECT
 FROM system.columns
 WHERE table = 'ct_certificates'
 
+SELECT
+    partition,
+    sum(rows) AS rows,
+    formatReadableSize(sum(bytes_on_disk)) AS size
+FROM system.parts
+WHERE (`table` = 'ct_certificates') AND active
+GROUP BY partition
+ORDER BY partition ASC
 ________________________________________________________________________
 SCHEMA MAINTENANCE / WRITING
 ________________________________________________________________________
