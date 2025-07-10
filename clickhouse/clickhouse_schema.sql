@@ -58,10 +58,6 @@ ________________________________________________________________________
  - Derived columns: dn (SAN), org_id, registrable (PSL), root, token arrays
  - Purpose: fast domain & country filters; feeds heuristics.
 
-3. mv_org_cert  (MergeTree)
- - One row per (org_id, certificate)
- - Avoids arrayJoin at query time for exact org lookups.
-
 4. org_root_sets  (periodically refreshed MergeTree)
  - Snapshot of de-noised “true” org_id <-> registrable relationships (one row per (org_id, registrable)).
  - Result of applying infra/denylist and org diversity (super-issuer) filters, and min domain depth logic.
@@ -1021,20 +1017,6 @@ FROM ct_certificates;
 /*-----------------------------------------------------------------------
   3.  Org -> certificate and org -> country lookup views
 -----------------------------------------------------------------------*/
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_org_cert
-ENGINE = MergeTree
-PARTITION BY toYYYYMM(lts)
-ORDER BY (org_id, sn)
-AS
-SELECT
-    org_id(org) AS org_id,
-    sn,
-    nbf,
-    naf, 
-    lts
-FROM ct_certificates
-ARRAY JOIN org
-WHERE org != '';
 
 CREATE OR REPLACE TABLE org_locations
 (
@@ -1239,6 +1221,7 @@ ENGINE = TinyLog;
 */
 CREATE OR REPLACE TABLE org_root_sets (
     org_id      UInt64,
+    organization String,
     registrable String,
     is_canonical_owner Bool,
     is_infra_org Bool,
@@ -1284,6 +1267,7 @@ REFRESH EVERY 1 DAY OFFSET 3 HOUR RANDOMIZE FOR 1 HOUR
 TO org_root_sets AS
 SELECT
     org_id(d.organization) AS org_id,
+    d.organization AS organization,
     d.registrable AS registrable,
     min(d.nbf) AS min_nbf,
     min(d.lts) AS min_lts,
@@ -1305,7 +1289,8 @@ LEFT JOIN registrable_canonical_override AS co
   AND (org_id(d.organization) = co.org_id)
 GROUP BY
     org_id,
-    d.registrable;
+    d.registrable,
+    d.organization;
 
 
 /*-----------------------------------------------------------------------
@@ -1388,27 +1373,117 @@ SETTINGS
     index_granularity = 8192, 
     allow_experimental_reverse_key = 1;
 
+
+/* org_autocomplete_clustered_mv
+
+This materialized view builds the autocomplete/search index for 
+organization names, clustering related aliases and grouping certificate
+ownership under canonical display names.
+
+- Surfaces the most "authoritative" display name for an organization cluster
+(as determined by certificate count, name depth, and canonical flags).
+- Emits all known aliases for autocomplete, grouped by the best canonical name.
+- Enables robust organization search/autocomplete in user-facing UIs.
+- Uses cluster_id as a synthetic key (hash of canonical name).
+
+How it works:
+1. name_signals:  
+    - Ingests org names and org_id from org_root_sets.
+    - Gathers metrics: certificate count, depth in the org tree, canonical owner, infra org flag.
+
+2. scored_names:  
+    - Calculates an authority_score for each org string in a cluster:
+        authority_score = cert_count * 1
+                        - min_depth * 5
+                        + 200 (if canonical owner)
+                        - 100 (if infra org)
+    - Note that infra orgs are NOT excluded, but are penalized. This allows
+    names like "Cloudflare, Inc." or "Microsoft Corporation" to remain
+    searchable/autocompletable, but less likely to become the main cluster
+    display name unless they are truly the canonical entity.
+
+3. cluster_map & clustered_orgs:
+    - Maps aliases to canonical org_ids for deduplication and alias expansion.
+    - Groups all org names/aliases and their authority scores for a given cluster.
+
+4. cluster_with_top:
+    - Sorts aliases by descending authority score.
+    - cluster_id = hash of display_name, used as key.
+
+5. Final SELECT:
+    - Emits:
+        - display_name: best canonical name for the cluster (highest-scoring)
+        - cluster_id: stable hash of display_name.
+        - cert_count: sum of all certificates for the cluster.
+        - aliases: unique set of all alias org names in the cluster (for autocomplete).
+    - Orders clusters by descending cert_count.
+
+Notes:
+    - "Infra" orgs (e.g. Cloudflare, Microsoft, Akamai) are included, but
+    generally will not dominate clusters unless they are true root owners.
+    - If a name appears in multiple clusters (e.g. due to acquisition or
+    poor root set resolution), it may appear in multiple alias lists.
+*/
 DROP VIEW IF EXISTS org_autocomplete_clustered_mv;
 CREATE MATERIALIZED VIEW org_autocomplete_clustered_mv
 REFRESH EVERY 1 DAY OFFSET 7 HOUR RANDOMIZE FOR 1 HOUR
 TO org_autocomplete_clustered AS
+WITH
+    name_signals AS (
+        SELECT
+            organization,
+            org_id(organization)           AS org_id,
+            count()                        AS cert_count,
+            min(min_depth)                 AS min_depth,
+            maxIf(is_canonical_owner, 1) = 1  AS is_canon,
+            maxIf(is_infra_org,      1) = 1  AS is_infra
+        FROM org_root_sets
+        GROUP BY org_id, organization
+    ),
+    scored_names AS (
+        SELECT
+            org_id,
+            organization,
+            cert_count,
+            min_depth,
+            is_canon,
+            is_infra,
+            (cert_count)            * 1.0
+          - (min_depth)            * 5.0
+          + (is_canon ? 200 : 0)
+          - (is_infra ? 100 : 0)
+            AS authority_score
+        FROM name_signals
+    ),
+    cluster_map AS (
+        SELECT alias_id AS org_id, canonical_id FROM org_alias_map
+        UNION ALL
+        SELECT canonical_id AS org_id, canonical_id FROM org_alias_map
+    ),
+    clustered_orgs AS (
+        SELECT
+            if(isNull(cm.canonical_id) OR cm.canonical_id = 0, sn.org_id, cm.canonical_id) AS cluster_id,
+            groupArray((sn.organization, sn.authority_score)) AS orgs,
+            sum(sn.cert_count) AS cert_count
+        FROM scored_names sn
+        LEFT JOIN cluster_map cm ON sn.org_id = cm.org_id
+        GROUP BY cluster_id
+    ),
+    cluster_with_top AS (
+        SELECT
+            cluster_id,
+            arraySort(x -> -x.2, orgs) AS top_orgs,
+            orgs,
+            cert_count
+        FROM clustered_orgs
+    )
 SELECT
-    if(m.canonical_id != 0, m.canonical_id, c.org_id) AS cluster_id,
-    groupArrayDistinct(c.organization) AS aliases,
-    canonical_org_name(groupArrayDistinct(c.organization)) AS display_name,
-    sum(c.count) AS cert_count
-FROM (
-    SELECT
-        org_id(arrayJoin(org)) AS org_id,
-        arrayJoin(org)         AS organization,
-        count()                AS count
-    FROM ct_certificates
-    WHERE arrayJoin(org) != ''
-      AND NOT dictHas('dict_org_alias_denylist', org_id(arrayJoin(org)))
-    GROUP BY org_id, organization
-) AS c
-LEFT JOIN org_alias_map m ON c.org_id = m.alias_id
-GROUP BY cluster_id
+    canonical_org_name(arraySlice(arrayMap(x -> (x.1), top_orgs), 1, 1)) AS display_name,
+    org_id(display_name) AS cluster_id,
+    sum(cert_count) AS cert_count,
+    arrayDistinct(flatten(groupArray(arrayDistinct(arrayMap(x -> (x.1), orgs))))) AS aliases
+FROM cluster_with_top
+GROUP BY display_name
 ORDER BY cert_count DESC;
 
 /*-----------------------------------------------------------------------
@@ -1663,7 +1738,6 @@ VALUES (9, '^([a-z0-9-]+\\.)+ghe\\.com$', 1, 'ghe.com', 'GitHub Enterprise Cloud
 
 SYSTEM RELOAD DICTIONARY dict_tech_patterns;
 
-
 -- Populate org_alias_denylist
 WITH orgs AS (
     SELECT arrayJoin([
@@ -1682,7 +1756,17 @@ WITH orgs AS (
         'Verizon Digital Media Services Inc.',
         'Kyndryl, Inc.',
         'TIBCO Software Inc',
-        'Atanar Technologies'
+        'Atanar Technologies',
+        'MarkMonitor, Inc.',
+        'Dynamic Network Services, Inc.',
+        'Dynamic Network Services Limited',
+        'Fastly, Inc',
+        'Distil Inc',
+        'DISTIL NETWORKS, INC.',
+        'Shared Services Canada',
+        'Acquia Inc',
+        'Khoros, LLC',
+        'Jive Software Inc.'
     ]) AS org_name
 )
 INSERT INTO org_alias_denylist
