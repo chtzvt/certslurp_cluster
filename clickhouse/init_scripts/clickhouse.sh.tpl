@@ -79,7 +79,7 @@ EOF
 sudo sysctl -p /etc/sysctl.d/99-delayacct.conf
 
 # Configure Clickhouse data directories
-mkdir -p "$MOUNT_POINT/data" "$MOUNT_POINT/tmp" "$MOUNT_POINT/user_files" "$MOUNT_POINT/access" "$MOUNT_POINT/ddl_queue"
+mkdir -p "$MOUNT_POINT/data" "$MOUNT_POINT/tmp" "$MOUNT_POINT/user_files" "$MOUNT_POINT/access" "$MOUNT_POINT/ddl_queue" "$MOUNT_POINT/top_level_domains"
 chown -R clickhouse:clickhouse "$MOUNT_POINT"
 
 cat >/etc/clickhouse-server/config.d/data_directories.xml <<EOF
@@ -107,6 +107,22 @@ cat >/etc/clickhouse-server/config.d/listen_ports.xml <<EOF
 </yandex>
 EOF
 
+# Configure Public Suffix List
+# Fetch the lastest public suffix list
+curl https://publicsuffix.org/list/public_suffix_list.dat -o $MOUNT_POINT/top_level_domains/public_suffix_list.dat
+
+# Create a stripped ICANN domain-only version of the PSL
+awk '/===BEGIN ICANN DOMAINS===/{flag=1; next} /===END ICANN DOMAINS===/{flag=0} flag' $MOUNT_POINT/top_level_domains/public_suffix_list.dat > $MOUNT_POINT/top_level_domains/icann_suffix_list.dat
+
+cat >/etc/clickhouse-server/config.d/public_suffix_lists.xml <<EOF
+<yandex>
+  <top_level_domains_path>$MOUNT_POINT/top_level_domains/</top_level_domains_path>
+  <top_level_domains_lists>
+      <public_suffix_list>public_suffix_list.dat</public_suffix_list>
+      <icann>icann_suffix_list.dat</icann>
+  </top_level_domains_lists>
+</yandex>
+EOF
 
 # Configure clickhouse users
 cat >/etc/clickhouse-server/users.d/init_users.xml <<EOF
