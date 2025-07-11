@@ -1358,7 +1358,7 @@ JOIN org_root_sets b
 WHERE a.allow_aliasing = 1
   AND b.allow_aliasing = 1
 GROUP BY alias_id, canonical_id
-HAVING min(a.min_depth) = 2 AND min(b.min_depth) = 2 AND inter_cnt >= 4;
+HAVING min(a.min_depth) = 2 AND min(b.min_depth) = 2 AND inter_cnt >= 3;
 
 
 /* This table is automatically maintained by org_autocomplete_clustered_mv.
@@ -1775,7 +1775,9 @@ WITH orgs AS (
         'Shared Services Canada',
         'Acquia Inc',
         'Khoros, LLC',
-        'Jive Software Inc.'
+        'Jive Software Inc.',
+        'Tyler Technologies, Inc.',
+        'Tyler Technologies'
     ]) AS org_name
 )
 INSERT INTO org_alias_denylist
