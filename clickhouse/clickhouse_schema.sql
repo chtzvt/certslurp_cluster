@@ -965,6 +965,7 @@ ALTER TABLE ct_certificates
 /*-----------------------------------------------------------------------
   2.  Domain-flattened view  (one row per SAN)
 -----------------------------------------------------------------------*/
+
 DROP TABLE IF EXISTS dns_flat;
 CREATE TABLE dns_flat
 (
@@ -1002,25 +1003,29 @@ SETTINGS index_granularity = 8192,
 
 DROP VIEW IF EXISTS mv_dns_flat;
 CREATE MATERIALIZED VIEW mv_dns_flat
+REFRESH EVERY 1 DAY
 TO dns_flat AS
 SELECT
     lowerUTF8(arrayJoin(arrayDistinct(dns)))           AS dn,
-    cutToFirstSignificantSubdomain(dn)                 AS registrable,
-    firstSignificantSubdomain(dn)                      AS root,
+    cutToFirstSignificantSubdomainCustom(dn, 'icann')  AS registrable,
+    firstSignificantSubdomainCustom(dn, 'icann')       AS root,
     topLevelDomain(registrable)                        AS tld,
     length(splitByChar('.', dn))                       AS depth,
     startsWith(dn, '*.')                               AS wildcard,
     arrayFilter(x -> length(x) > 0, splitByChar('.', lowerUTF8(dn))) AS dn_tokens_full,
 
-    arrayJoin(org)                                     AS organization,
-    arrayElement(ou,  1)                               AS ou,
-    arrayElement(loc, 1)                               AS locality,
-    arrayElement(prv, 1)                               AS province,
-    arrayElement(co,  1)                               AS country,
-    org_id(organization)                               AS org_id,
+    -- join to override table on registrable, prefer override if present
+    COALESCE(NULLIF(co.owner_name, ''), arrayJoin(if(length(org) > 0, org, ['']))) AS organization,
+    if(length(ou) > 0, arrayElement(ou, 1), '')        AS ou,
+    if(length(loc) > 0, arrayElement(loc, 1), '')      AS locality,
+    if(length(prv) > 0, arrayElement(prv, 1), '')      AS province,
+    if(length(co) > 0, arrayElement(co, 1), '')        AS country,
+
+    org_id(organization) AS org_id,
 
     nbf, sn, lts
-FROM ct_certificates;
+FROM ct_certificates
+LEFT JOIN registrable_canonical_override AS co ON cutToFirstSignificantSubdomainCustom(arrayJoin(arrayDistinct(dns)), 'icann') = co.registrable;
 
 /*-----------------------------------------------------------------------
   3.  Org -> certificate and org -> country lookup views
@@ -1051,7 +1056,7 @@ SELECT
     lowerUTF8(locality) AS locality,
     lowerUTF8(tld) AS tld
 FROM dns_flat
-WHERE country != ''
+WHERE country != '' AND organization != ''
 GROUP BY org_id, country, province, locality, tld;
 
 /*-----------------------------------------------------------------------
@@ -1129,6 +1134,7 @@ SELECT
     min(depth) AS min_depth,
     any(organization) AS org_name
 FROM dns_flat
+WHERE organization != ''
 GROUP BY org_id
 ORDER BY registrable_count DESC;
 
@@ -1255,6 +1261,8 @@ ORDER BY (org_id, registrable);
   Key logic:
     - Canonical ownership is determined either by explicit override or
       by the org_id's relationship to the registrable.
+    - If organization is empty, but there’s a canonical override for that registrable, use the override value. Otherwise, 
+    skip rows where the org is empty and there’s no override.
     - Infra orgs are those appearing in the denylist *or* surpassing the
       org diversity threshold (via org_diversity_signal).
     - Aliasing is permitted only for non-infra orgs or the canonical owner.
@@ -1274,17 +1282,17 @@ CREATE MATERIALIZED VIEW org_root_sets_mv
 REFRESH EVERY 1 DAY OFFSET 3 HOUR RANDOMIZE FOR 1 HOUR
 TO org_root_sets AS
 SELECT
-    org_id(d.organization) AS org_id,
-    d.organization AS organization,
+    COALESCE(COALESCE(NULLIF(co.owner_name, ''), NULLIF(d.organization, '')), '') AS organization,
+    org_id(organization) AS org_id,
     d.registrable AS registrable,
     min(d.nbf) AS min_nbf,
     min(d.lts) AS min_lts,
     max(d.lts) AS max_lts,
     min(d.depth) AS min_depth,
     -- Is this org the canonical owner of this registrable?
-    max(co.org_id) = org_id(d.organization) AS is_canonical_owner,
+    max(co.org_id) = org_id AS is_canonical_owner,
     -- Is it an infra org? (in denylist or hits org diversity threshold)
-    dictHas('dict_org_alias_denylist', org_id(d.organization)) 
+    dictHas('dict_org_alias_denylist', org_id) 
       OR (max(ds.org_id) != 0) AS is_infra_org,
     -- Allow aliasing if NOT infra, or if canonical owner
     (NOT is_infra_org OR is_canonical_owner) AS allow_aliasing
@@ -1294,11 +1302,12 @@ LEFT JOIN org_diversity_signal AS ds
   AND (ds.registrable_count > 1000)
 LEFT JOIN registrable_canonical_override AS co
   ON (d.registrable = co.registrable)
-  AND (org_id(d.organization) = co.org_id)
+WHERE COALESCE(NULLIF(co.owner_name, ''), NULLIF(d.organization, '')) IS NOT NULL
 GROUP BY
     org_id,
     d.registrable,
-    d.organization;
+    organization
+HAVING organization != '';
 
 
 /*-----------------------------------------------------------------------
@@ -1789,15 +1798,16 @@ FROM orgs;
 SYSTEM RELOAD DICTIONARY dict_org_alias_denylist;
 
 -- Populate registrable_canonical_override
-WITH overrides AS (
-    SELECT
-        'nba.com' AS registrable, 'NBA Media Ventures, LLC' AS owner_name
-    UNION ALL
-    SELECT 'trutv.com', 'Warner Bros. Discovery, Inc.'
-)
+WITH
+    arrayJoin([
+        ('nba.com',       'NBA Media Ventures, LLC'),
+        ('trutv.com',     'Warner Bros. Discovery, Inc.'),
+        ('github.com',    'GitHub, Inc.'),
+        ('ghe.com',    'GitHub, Inc.'),
+        ('linkedin.com',  'LinkedIn Corporation')
+    ]) AS pair
 INSERT INTO registrable_canonical_override
 SELECT
-    registrable,
-    org_id(owner_name) AS org_id,
-    owner_name
-FROM overrides;
+    pair.1 AS registrable,
+    org_id(pair.2) AS org_id,
+    pair.2 AS owner_name
