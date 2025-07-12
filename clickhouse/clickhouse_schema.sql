@@ -1003,7 +1003,7 @@ SETTINGS index_granularity = 8192,
 
 DROP VIEW IF EXISTS mv_dns_flat;
 CREATE MATERIALIZED VIEW mv_dns_flat
-REFRESH EVERY 1 DAY
+REFRESH EVERY 1 DAY OFFSET 18 HOUR
 TO dns_flat AS
 SELECT
     lowerUTF8(arrayJoin(arrayDistinct(dns)))           AS dn,
