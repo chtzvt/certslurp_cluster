@@ -39,7 +39,7 @@ FROM azureBlobStorage(
 )
 
 -- Only records from 2024-01-01 onwards
-WHERE toDateTime64(lts/1000, 6, 'UTC') >= toDateTime64('2024-01-01 00:00:00', 6, 'UTC')
+WHERE lts >= toDateTime64('2024-01-01 00:00:00', 6, 'UTC')
 
 SETTINGS
     -- split the JSONL stream every ~64 k rows
