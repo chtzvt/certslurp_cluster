@@ -219,7 +219,7 @@ resource "azurerm_managed_disk" "clickhouse_data" {
   resource_group_name  = azurerm_resource_group.main.name
   zone                 = 1
   storage_account_type = "PremiumV2_LRS"
-  disk_size_gb         = 4096
+  disk_size_gb         = 7168
 }
 
 resource "azurerm_virtual_machine_data_disk_attachment" "clickhouse" {
