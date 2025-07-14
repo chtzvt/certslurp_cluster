@@ -962,6 +962,28 @@ ALTER TABLE ct_certificates
     ADD INDEX IF NOT EXISTS idx_cn     cn TYPE tokenbf_v1(2048,3,0)      GRANULARITY 4,
     ADD INDEX IF NOT EXISTS idx_sub    sub TYPE tokenbf_v1(2048,3,0)      GRANULARITY 4;
 
+/*
+  registrable_canonical_override
+
+  Table of manual overrides mapping registrable domains to their *canonical*
+  organizational owner. Used to fix cases where the default org_id logic
+  is insufficient (e.g. mergers, legal parent/child relationships, etc).
+
+  - registrable:  Domain name (e.g., 'example.com').
+  - org_id:       Canonical owner org_id for this registrable.
+  - owner_name:   Display name for reference.
+
+  Notes:
+    - Use only for true overrides—avoid overuse.
+    - Always keep entries deduplicated and current.
+*/
+CREATE OR REPLACE TABLE registrable_canonical_override (
+    registrable  String,
+    org_id       UInt64,
+    owner_name   String
+)
+ENGINE = TinyLog;
+
 /*-----------------------------------------------------------------------
   2.  Domain-flattened view  (one row per SAN)
 -----------------------------------------------------------------------*/
@@ -1184,28 +1206,6 @@ SOURCE(CLICKHOUSE(TABLE 'org_alias_denylist'))
 LAYOUT(HASHED())
 LIFETIME(MIN 300 MAX 3600);
 
-
-/*
-  registrable_canonical_override
-
-  Table of manual overrides mapping registrable domains to their *canonical*
-  organizational owner. Used to fix cases where the default org_id logic
-  is insufficient (e.g. mergers, legal parent/child relationships, etc).
-
-  - registrable:  Domain name (e.g., 'example.com').
-  - org_id:       Canonical owner org_id for this registrable.
-  - owner_name:   Display name for reference.
-
-  Notes:
-    - Use only for true overrides—avoid overuse.
-    - Always keep entries deduplicated and current.
-*/
-CREATE OR REPLACE TABLE registrable_canonical_override (
-    registrable  String,
-    org_id       UInt64,
-    owner_name   String
-)
-ENGINE = TinyLog;
 
 /*
   org_root_sets
