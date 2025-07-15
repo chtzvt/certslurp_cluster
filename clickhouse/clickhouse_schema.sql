@@ -1804,7 +1804,26 @@ WITH
         ('trutv.com',     'Warner Bros. Discovery, Inc.'),
         ('github.com',    'GitHub, Inc.'),
         ('ghe.com',    'GitHub, Inc.'),
-        ('linkedin.com',  'LinkedIn Corporation')
+        ('linkedin.com',  'LinkedIn Corporation'),
+        ('splunkcloud.com',          'Splunk Inc.'),
+        ('splunkcloudgc.com',        'Splunk Inc.'),
+        ('vercel-storage.com',       'Vercel Inc.'),
+        ('vercel.app',               'Vercel Inc.'),
+        ('workers.dev',              'Cloudflare, Inc.'),
+        ('pages.dev',                'Cloudflare, Inc.'),
+        ('herokuapp.com',            'Heroku'),
+        ('herokuspace.com',          'Heroku'),
+        ('herokusnitest.com',        'Heroku'),
+        ('plesk.page',               'WebPros International GmbH'),
+        ('platformsh.site',          'Platform.sh Ltd'),
+        ('catalyst-sandbox-vercel.store', 'BigCommerce Inc.'),
+        ('innfinite.co.uk',          'Innfinite Web Solutions Ltd'),
+        ('moonscale.net',            'Ici la Lune'),
+        ('cprapid.com',              'cPanel LLC'),
+        ('bookfocal.com',            'Focal Inc.'),
+        ('vagabundo.co',             'Vagabundo'),
+        ('konimbo.co.il',            'Konimbo'),
+        ('it-dept.ca',               'Shared Services Canada')
     ]) AS pair
 INSERT INTO registrable_canonical_override
 SELECT
