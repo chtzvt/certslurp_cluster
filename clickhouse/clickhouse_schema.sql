@@ -58,49 +58,49 @@ ________________________________________________________________________
  - Derived columns: dn (SAN), org_id, registrable (PSL), root, token arrays
  - Purpose: fast domain & country filters; feeds heuristics.
 
-4. org_root_sets  (periodically refreshed MergeTree)
+3. org_root_sets  (periodically refreshed MergeTree)
  - Snapshot of de-noised “true” org_id <-> registrable relationships (one row per (org_id, registrable)).
  - Result of applying infra/denylist and org diversity (super-issuer) filters, and min domain depth logic.
  - Columns flag canonical ownership and allow/disallow aliasing/merging.
  - Refreshed automatically by org_root_sets_mv; do not manually insert or update.
 Tunable parameters: org_diversity_signal threshold, denylist, canonical overrides.
 
-5. org_alias_map  (periodically refreshed MergeTree)
+4. org_alias_map  (periodically refreshed MergeTree)
  - All pairs of org_ids sharing >=N registrable roots (default: N=5), where both are allowed to be aliased.
  - Used for alias cluster detection and autocomplete grouping.
  - Excludes infra orgs, super-issuers, and noisy relationships by using org_root_sets as its source.
  - Fast graph view of plausible org merges for UI, search, and clustering.
 
-6. org_autocomplete_clustered  (periodically refreshed MergeTree)
+5. org_autocomplete_clustered  (periodically refreshed MergeTree)
  - Autocomplete index and search clusters for organizations.
  - Each row represents an alias cluster (cluster_id), with display name, list of aliases, and cert count.
  - Used for fuzzy org lookup, search UI, and reporting.
  - Automatically deduplicated and grouped via alias mapping; updated on schedule.
 
-7. tech_patterns/dict_tech_patterns/dict_regex_prefixes
+6. tech_patterns/dict_tech_patterns/dict_regex_prefixes
  - Editable patterns and live-reload dictionaries for token/regex -> tech mapping.
 
-8. tech_signals  (ReplacingMergeTree)
+7. tech_signals  (ReplacingMergeTree)
  - All technology "signals" (from heuristics + external sources)
  - Evidence, source, confidence, is_negative fields
  - Very robust deduplication logic
  - Continuously refreshed by mv_ct_tech_signals
 
-9. mv_ct_tech_signals
+8. mv_ct_tech_signals
  - Insert tech_signals from token and regex matches in mv_dns_flat.
  - Refreshes on schedule
 
-10. mv_org_tech / org_tech_facts (AggregatingMergeTree/view)
+9. mv_org_tech / org_tech_facts (AggregatingMergeTree/view)
  - One row per (org_id, tech); highest-confidence, deduped
  - API and reporting table
 
-11. etl_ingest_metrics
+10. etl_ingest_metrics
  - All ETL/ingest job runs (row count, duration, errors, partition, etc.)
 
-12. mv_partition_stats, slow_queries
+11. mv_partition_stats, slow_queries
  - System-level metrics and performance diagnostics
 
-13. org_locations
+12. org_locations
  - 1 row per country/province/locality/org ID
  - Simplifies organization lookup by geographical location
  - Note that all fields are lowercased
@@ -1299,7 +1299,7 @@ SELECT
 FROM dns_flat AS d
 LEFT JOIN org_diversity_signal AS ds
   ON (org_id(d.organization) = ds.org_id)
-  AND (ds.registrable_count > 1000)
+  AND (ds.registrable_count > 10000) -- Tunable diversity threshold
 LEFT JOIN registrable_canonical_override AS co
   ON (d.registrable = co.registrable)
 WHERE COALESCE(NULLIF(co.owner_name, ''), NULLIF(d.organization, '')) IS NOT NULL
@@ -1621,15 +1621,17 @@ REFRESH EVERY 1 DAY OFFSET 6 HOUR RANDOMIZE FOR 1 HOUR
 TO tech_signals AS
 -- pattern match (dict_tech_patterns)
 SELECT
-    df.lts                        AS ts,
-    df.org_id                     AS org_id,
-    df.registrable                AS registrable,
-    tp.tech                       AS tech,
-    tp.weight                     AS confidence,
-    'ct_heuristic'                AS source,
-    arraySort(arrayDistinct([tuple('dns', df.dn)]))         AS evidence,
-    0                             AS is_negative
+    df.lts                                                AS ts,
+    COALESCE(ogr.org_id, df.org_id)                       AS org_id,        -- use canonical if available
+    df.registrable                                        AS registrable,
+    tp.tech                                               AS tech,
+    tp.weight                                             AS confidence,
+    'ct_heuristic'                                        AS source,
+    arraySort(arrayDistinct([tuple('dns', df.dn)]))       AS evidence,
+    0                                                     AS is_negative
 FROM dns_flat AS df
+LEFT JOIN org_root_sets AS ogr
+  ON df.registrable = ogr.registrable AND ogr.allow_aliasing = 1
 CROSS JOIN (
     SELECT pattern, tech, weight
     FROM dict_tech_patterns
@@ -1646,15 +1648,17 @@ WHERE arrayExists(
 UNION ALL
 -- regex match (dict_regex_prefixes)
 SELECT
-    df.lts                  AS ts,
-    df.org_id               AS org_id,
-    df.registrable          AS registrable,
-    rp.tech                 AS tech,
-    rp.weight               AS confidence,
-    'ct_heuristic'          AS source,
-    arraySort(arrayDistinct([tuple('dns', df.dn)]))   AS evidence,
-    0                       AS is_negative
+    df.lts                                                AS ts,
+    COALESCE(ogr.org_id, df.org_id)                       AS org_id,        -- use canonical if available
+    df.registrable                                        AS registrable,
+    rp.tech                                               AS tech,
+    rp.weight                                             AS confidence,
+    'ct_heuristic'                                        AS source,
+    arraySort(arrayDistinct([tuple('dns', df.dn)]))       AS evidence,
+    0                                                     AS is_negative
 FROM dns_flat AS df
+LEFT JOIN org_root_sets AS ogr
+  ON df.registrable = ogr.registrable AND ogr.allow_aliasing = 1
 CROSS JOIN (
     SELECT regex_prefix, pattern, tech, weight
     FROM dict_regex_prefixes
@@ -1742,21 +1746,21 @@ ORDER BY event_time;
   8. Seeds
 -----------------------------------------------------------------------*/
 INSERT INTO tech_patterns (id, pattern, is_regex, tech, weight) VALUES
-(1,'bitbucket',0,'Bitbucket', 1.0),
-(2,'gitlab',   0,'GitLab',    1.0),
-(3,'github',   0,'GitHub',    1.0),
-(4,'vercel',   0,'Vercel',    1.0),
-(5,'heroku',   0,'Heroku',    1.0),
-(6,'splunk',   0,'Splunk',    1.0),
-(7,'jenkins',  0,'Jenkins',   1.0),
-(8,'jfrog',    0,'JFrog',     1.0);
+(1,'bitbucket',0,'Bitbucket', 0.5),
+(2,'gitlab',   0,'GitLab',    0.5),
+(3,'github',   0,'GitHub',    0.5),
+(4,'vercel',   0,'Vercel',    0.5),
+(5,'heroku',   0,'Heroku',    0.5),
+(6,'splunk',   0,'Splunk',    0.5),
+(7,'jenkins',  0,'Jenkins',   0.5),
+(8,'jfrog',    0,'JFrog',     0.5);
 
 INSERT INTO tech_patterns (id, pattern, is_regex, regex_prefix, tech, weight)
 VALUES (9, '^([a-z0-9-]+\\.)+ghe\\.com$', 1, 'ghe.com', 'GitHub Enterprise Cloud (Data Residency)', 1.0);
 
 SYSTEM RELOAD DICTIONARY dict_tech_patterns;
 
--- Populate org_alias_denylist
+-- Seed org_alias_denylist
 WITH orgs AS (
     SELECT arrayJoin([
         'Microsoft Corporation',
@@ -1769,7 +1773,10 @@ WITH orgs AS (
         'CDNETWORKS CO., LTD.',
         'Shopify Inc.',
         'Salesforce.com, Inc.',
+        'Salesforce, Inc.',
         'Adobe Systems Co., Ltd.',
+        'Adobe Systems Incorporated',
+        'HCA - Information Technology & Services, Inc.',
         'Firebase, Inc.',
         'Verizon Digital Media Services Inc.',
         'Kyndryl, Inc.',
@@ -1797,7 +1804,7 @@ FROM orgs;
 
 SYSTEM RELOAD DICTIONARY dict_org_alias_denylist;
 
--- Populate registrable_canonical_override
+-- Seed registrable_canonical_override
 WITH
     arrayJoin([
         ('nba.com',       'NBA Media Ventures, LLC'),
