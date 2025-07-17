@@ -1025,7 +1025,6 @@ SETTINGS index_granularity = 8192,
 
 DROP VIEW IF EXISTS mv_dns_flat;
 CREATE MATERIALIZED VIEW mv_dns_flat
-REFRESH EVERY 1 DAY OFFSET 18 HOUR
 TO dns_flat AS
 SELECT
     lowerUTF8(arrayJoin(arrayDistinct(dns)))           AS dn,
@@ -1618,7 +1617,7 @@ SETTINGS
 DROP VIEW IF EXISTS mv_ct_tech_signals;
 CREATE MATERIALIZED VIEW mv_ct_tech_signals
 REFRESH EVERY 1 DAY OFFSET 6 HOUR RANDOMIZE FOR 1 HOUR
-TO tech_signals AS
+APPEND TO tech_signals AS
 -- pattern match (dict_tech_patterns)
 SELECT
     df.lts                                                AS ts,
@@ -1836,4 +1835,4 @@ INSERT INTO registrable_canonical_override
 SELECT
     pair.1 AS registrable,
     org_id(pair.2) AS org_id,
-    pair.2 AS owner_name
+    pair.2 AS owner_name;
