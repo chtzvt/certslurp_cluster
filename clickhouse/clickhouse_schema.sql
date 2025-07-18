@@ -279,6 +279,28 @@ WHERE (f.tech = 'GitLab') AND (f.confidence >= 0.5) AND (f.org_id IN (
 ORDER BY f.last_seen DESC
 LIMIT 100;
 
+
+* Rollup of technology detections per (organization cluster, tech), with display names and de-duplicated org clustering.
+For every technology (t.tech) detected:
+- Count how many signals exist, grouped by canonical org cluster (ac.cluster_id, ac.display_name)
+- Only include orgs that pass the allow_aliasing filter from org_root_sets (so, not infra/noisy orgs)
+- Results are ordered by number of detections (most detected tech/org pairs first)
+
+SELECT
+    ac.cluster_id,
+    ac.display_name,
+    t.tech,
+    count() AS detection_count
+FROM tech_signals AS t
+JOIN org_root_sets AS r
+  ON t.registrable = r.registrable
+ AND t.org_id = r.org_id
+ AND r.allow_aliasing = 1
+JOIN org_autocomplete_clustered AS ac
+  ON r.org_id = ac.cluster_id
+GROUP BY ac.cluster_id, ac.display_name, t.tech
+ORDER BY detection_count DESC
+
 * Growth of .bitbucket registrable domains in DE:
 WITH
 orgs_in_de AS (
@@ -977,12 +999,18 @@ ALTER TABLE ct_certificates
     - Use only for true overrides—avoid overuse.
     - Always keep entries deduplicated and current.
 */
-CREATE OR REPLACE TABLE registrable_canonical_override (
-    registrable  String,
-    org_id       UInt64,
-    owner_name   String
+CREATE OR REPLACE TABLE registrable_canonical_override
+(
+    registrable String,
+    org_id      UInt64,
+    owner_name  String,
+
+    INDEX idx_org_id (org_id) TYPE set(0) GRANULARITY 1,
+    INDEX idx_owner_name_tokenbf (owner_name) TYPE tokenbf_v1(2048,3,0) GRANULARITY 4
 )
-ENGINE = TinyLog;
+ENGINE = ReplacingMergeTree()
+ORDER BY registrable
+SETTINGS index_granularity = 8192;
 
 /*-----------------------------------------------------------------------
   2.  Domain-flattened view  (one row per SAN)
@@ -1175,11 +1203,17 @@ ORDER BY registrable_count DESC;
     - Maintain via explicit governance—mistakes can break canonical logic.
     - Write changes atomically if possible.
 */
-CREATE OR REPLACE TABLE org_alias_denylist (
-    org_id   UInt64,
-    org_name String
+CREATE OR REPLACE TABLE org_alias_denylist
+(
+    org_id      UInt64,
+    org_name    String,
+
+    INDEX idx_org_id (org_id) TYPE set(0) GRANULARITY 1,
+    INDEX idx_org_name_tokenbf (org_name) TYPE tokenbf_v1(2048,3,0) GRANULARITY 4
 )
-ENGINE = TinyLog;
+ENGINE = ReplacingMergeTree()
+ORDER BY org_id
+SETTINGS index_granularity = 8192;
 
 /*
   dict_org_alias_denylist
@@ -1792,7 +1826,8 @@ WITH orgs AS (
         'Khoros, LLC',
         'Jive Software Inc.',
         'Tyler Technologies, Inc.',
-        'Tyler Technologies'
+        'Tyler Technologies',
+        'Akamai Technologies, Inc.'
     ]) AS org_name
 )
 INSERT INTO org_alias_denylist
@@ -1829,7 +1864,21 @@ WITH
         ('bookfocal.com',            'Focal Inc.'),
         ('vagabundo.co',             'Vagabundo'),
         ('konimbo.co.il',            'Konimbo'),
-        ('it-dept.ca',               'Shared Services Canada')
+        ('it-dept.ca',               'Shared Services Canada'),
+        ('dell.com',                 'Dell Technologies Inc.'),
+        ('dellfaas.com',             'Dell Technologies Inc.'),
+        ('att-idns.net',             'AT&T Services, Inc.'),
+        ('att-mail.com',             'AT&T Services, Inc.'),
+        ('att.net',                  'AT&T Services, Inc.'),
+        ('atttest.com',              'AT&T Services, Inc.'),
+        ('attws.com',                'AT&T Services, Inc.'),
+        ('cingular.net',             'AT&T Services, Inc.'),
+        ('sbc.com',                  'AT&T Services, Inc.'),
+        ('att.com',                  'AT&T Services, Inc.'),
+        ('criticalmissionsolutions.com', 'Jacobs Solutions Inc.'),
+        ('jacobs.com',                   'Jacobs Solutions Inc.'),
+        ('keywcorp.com',                 'Jacobs Solutions Inc.'),
+        ('streetlightdata.com',          'Jacobs Solutions Inc.')
     ]) AS pair
 INSERT INTO registrable_canonical_override
 SELECT
