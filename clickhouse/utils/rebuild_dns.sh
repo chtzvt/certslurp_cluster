@@ -1,12 +1,12 @@
-# Use this script to rebuild the dns_flat table if needed
-
 #!/bin/bash
 
 CLICKHOUSE="clickhouse-client"
 TABLE="ct_certificates"
 START_MONTH=202401   # Jan 2024
 END_MONTH=$(date +"%Y%m" -d "last month")
-CONCURRENCY=4        # Tune to taste
+CONCURRENCY=3
+MAX_BLOCK=8192
+MAX_INSERT_BLOCK=4096
 
 months=()
 ym=$START_MONTH
@@ -35,7 +35,7 @@ for range in "${months[@]}"; do
 
     (
       echo "[$(date)] Processing $week_start to $week_end"
-      $CLICKHOUSE --query="SET max_block_size = 16384; SET max_insert_block_size = 8192; INSERT INTO $TABLE SELECT * FROM $TABLE WHERE nbf >= '$week_start' AND nbf < '$week_end';" \
+      $CLICKHOUSE --query="SET max_block_size = $MAX_BLOCK; SET max_insert_block_size = $MAX_INSERT_BLOCK; INSERT INTO $TABLE SELECT * FROM $TABLE WHERE nbf >= '$week_start' AND nbf < '$week_end';" \
         && echo "[$(date)] Finished $week_start to $week_end" \
         || echo "[$(date)] FAILED $week_start to $week_end"
     ) &
