@@ -915,6 +915,28 @@ CREATE OR REPLACE FUNCTION canonical_org_name AS names ->
     ).2
 ;
 
+
+/*
+  PSL-aware effective TLD + 1
+*/
+CREATE OR REPLACE FUNCTION psl_registrable AS (dn) ->
+    cutToFirstSignificantSubdomainCustom(dn, 'public_suffix_list');
+
+/*
+  The PSL *suffix* of the given domain (eTLD)
+*/
+CREATE OR REPLACE FUNCTION psl_suffix AS (dn) ->
+    arrayStringConcat(
+        arrayPopFront(
+            arrayFilter(x -> length(x) > 0, splitByChar('.', cutToFirstSignificantSubdomainCustom(dn, 'public_suffix_list')))
+        ),
+        '.'
+    );
+
+-- The ICANN TLD of a given domain
+CREATE OR REPLACE FUNCTION psl_tld AS (dn) -> 
+    topLevelDomain(dn);
+
 /*-----------------------------------------------------------------------
   1.  Raw certificate landing table
 -----------------------------------------------------------------------*/
@@ -1051,30 +1073,44 @@ ORDER BY (country, registrable, root, dn)
 SETTINGS index_granularity = 8192,
          min_bytes_for_wide_part = 134217728;
 
+
 DROP VIEW IF EXISTS mv_dns_flat;
 CREATE MATERIALIZED VIEW mv_dns_flat
 TO dns_flat AS
+WITH
+    lowerUTF8(arrayJoin(arrayDistinct(dns))) AS dn,
+    psl_registrable(dn) AS registrable,
+    psl_suffix(registrable) AS root,
+    psl_tld(registrable) AS tld,
+    length(splitByChar('.', registrable)) - length(splitByChar('.', root)) AS depth,
+    startsWith(dn, '*.') AS wildcard,
+    arrayFilter(x -> length(x) > 0, splitByChar('.', dn)) AS dn_tokens_full
 SELECT
-    lowerUTF8(arrayJoin(arrayDistinct(dns)))           AS dn,
-    cutToFirstSignificantSubdomainCustom(dn, 'icann')  AS registrable,
-    firstSignificantSubdomainCustom(dn, 'icann')       AS root,
-    topLevelDomain(registrable)                        AS tld,
-    length(splitByChar('.', dn))                       AS depth,
-    startsWith(dn, '*.')                               AS wildcard,
-    arrayFilter(x -> length(x) > 0, splitByChar('.', lowerUTF8(dn))) AS dn_tokens_full,
+    dn,
+    registrable,
+    root,
+    tld,
+    depth,
+    wildcard,
+    dn_tokens_full,
 
-    -- join to override table on registrable, prefer override if present
-    COALESCE(NULLIF(co.owner_name, ''), arrayJoin(if(length(org) > 0, org, ['']))) AS organization,
-    if(length(ou) > 0, arrayElement(ou, 1), '')        AS ou,
-    if(length(loc) > 0, arrayElement(loc, 1), '')      AS locality,
-    if(length(prv) > 0, arrayElement(prv, 1), '')      AS province,
-    if(length(co) > 0, arrayElement(co, 1), '')        AS country,
+    -- hierarchical override lookup
+    COALESCE(
+        NULLIF(co_reg.owner_name, ''),
+        NULLIF(co_root.owner_name, ''),
+        arrayJoin(if(length(org) > 0, org, ['']))
+    ) AS organization,
 
-    org_id(organization) AS org_id,
+    if(length(ou) > 0, ou[1], '')        AS ou,
+    if(length(loc) > 0, loc[1], '')      AS locality,
+    if(length(prv) > 0, prv[1], '')      AS province,
+    if(length(co) > 0, co[1], '')        AS country,
 
+    org_id(organization)                 AS org_id,
     nbf, sn, lts
 FROM ct_certificates
-LEFT JOIN registrable_canonical_override AS co ON cutToFirstSignificantSubdomainCustom(arrayJoin(arrayDistinct(dns)), 'icann') = co.registrable;
+LEFT JOIN registrable_canonical_override AS co_reg ON registrable = co_reg.registrable
+LEFT JOIN registrable_canonical_override AS co_root ON root = co_root.registrable;
 
 /*-----------------------------------------------------------------------
   3.  Org -> certificate and org -> country lookup views
