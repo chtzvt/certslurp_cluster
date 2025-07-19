@@ -1082,7 +1082,7 @@ WITH
     psl_registrable(dn) AS registrable,
     psl_suffix(registrable) AS root,
     psl_tld(registrable) AS tld,
-    length(splitByChar('.', registrable)) - length(splitByChar('.', root)) AS depth,
+    length(splitByChar('.', dn)) - length(splitByChar('.', registrable)) AS depth,
     startsWith(dn, '*.') AS wildcard,
     arrayFilter(x -> length(x) > 0, splitByChar('.', dn)) AS dn_tokens_full
 SELECT
