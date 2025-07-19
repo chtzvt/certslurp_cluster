@@ -4,14 +4,12 @@ CLICKHOUSE="clickhouse-client"
 TABLE="ct_certificates"
 START_MONTH=202401   # Jan 2024
 END_MONTH=$(date +"%Y%m" -d "last month")
-CONCURRENCY=4
-MAX_BLOCK=4096
-MAX_INSERT_BLOCK=2048
+CONCURRENCY=3
+MAX_BLOCK=2048
+MAX_INSERT_BLOCK=1024
 
 months=()
 ym=$START_MONTH
-
-trap 'kill $(jobs -p) 2>/dev/null' SIGINT
 
 # Step 1: Build months array
 while [[ $ym -le $END_MONTH ]]; do
