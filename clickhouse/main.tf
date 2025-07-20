@@ -158,9 +158,11 @@ resource "azurerm_network_security_group" "clickhouse" {
 
 # Clickhouse VM
 resource "azurerm_network_interface" "clickhouse" {
-  name                = "clickhouse-nic"
-  location            = local.location
-  resource_group_name = azurerm_resource_group.main.name
+  name                           = "clickhouse-nic"
+  location                       = local.location
+  resource_group_name            = azurerm_resource_group.main.name
+  accelerated_networking_enabled = true
+
   ip_configuration {
     name                          = "internal"
     subnet_id                     = azurerm_subnet.clickhouse.id
@@ -186,7 +188,7 @@ resource "azurerm_linux_virtual_machine" "clickhouse" {
   name                  = "clickhouse-vm"
   resource_group_name   = azurerm_resource_group.main.name
   location              = local.location
-  size                  = "Standard_E8bs_v5"
+  size                  = "Standard_B32as_v2"
   admin_username        = "azureuser"
   network_interface_ids = [azurerm_network_interface.clickhouse.id]
   zone                  = 1
