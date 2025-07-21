@@ -1360,16 +1360,23 @@ DROP VIEW IF EXISTS org_root_sets_mv;
 CREATE MATERIALIZED VIEW org_root_sets_mv
 REFRESH EVERY 1 DAY OFFSET 3 HOUR RANDOMIZE FOR 1 HOUR
 TO org_root_sets AS
+WITH
+    COALESCE(
+      NULLIF(dictGetOrDefault('dict_registrable_canonical_override', 'owner_name', d.registrable, ''), ''),
+      NULLIF(d.organization, ''),
+      ''
+    ) AS organization,
+    org_id(organization) AS org_id
 SELECT
-    COALESCE(COALESCE(NULLIF(co.owner_name, ''), NULLIF(d.organization, '')), '') AS organization,
-    org_id(organization) AS org_id,
+    organization,
+    org_id,
     d.registrable AS registrable,
     min(d.nbf) AS min_nbf,
     min(d.lts) AS min_lts,
     max(d.lts) AS max_lts,
     min(d.depth) AS min_depth,
     -- Is this org the canonical owner of this registrable?
-    max(co.org_id) = org_id AS is_canonical_owner,
+    dictGetOrDefault('dict_registrable_canonical_override', 'org_id', d.registrable, 0) = org_id AS is_canonical_owner,
     -- Is it an infra org? (in denylist or hits org diversity threshold)
     dictHas('dict_org_alias_denylist', org_id) 
       OR (max(ds.org_id) != 0) AS is_infra_org,
@@ -1379,9 +1386,7 @@ FROM dns_flat AS d
 LEFT JOIN org_diversity_signal AS ds
   ON (org_id(d.organization) = ds.org_id)
   AND (ds.registrable_count > 10000) -- Tunable diversity threshold
-LEFT JOIN registrable_canonical_override AS co
-  ON (d.registrable = co.registrable)
-WHERE COALESCE(NULLIF(co.owner_name, ''), NULLIF(d.organization, '')) IS NOT NULL
+WHERE organization != ''
 GROUP BY
     org_id,
     d.registrable,
