@@ -1034,6 +1034,18 @@ ENGINE = ReplacingMergeTree()
 ORDER BY registrable
 SETTINGS index_granularity = 8192;
 
+DROP DICTIONARY IF EXISTS dict_registrable_canonical_override;
+CREATE DICTIONARY dict_registrable_canonical_override
+(
+    registrable String,
+    org_id      UInt64,
+    owner_name  String,
+)
+PRIMARY KEY registrable
+SOURCE(CLICKHOUSE(TABLE 'registrable_canonical_override'))
+LAYOUT(HASHED())
+LIFETIME(MIN 300 MAX 3600);
+
 /*-----------------------------------------------------------------------
   2.  Domain-flattened view  (one row per SAN)
 -----------------------------------------------------------------------*/
@@ -1096,8 +1108,8 @@ SELECT
 
     -- hierarchical override lookup
     COALESCE(
-        NULLIF(co_reg.owner_name, ''),
-        NULLIF(co_root.owner_name, ''),
+        NULLIF(dictGetOrDefault('dict_registrable_canonical_override', 'owner_name', registrable, ''), ''),
+        NULLIF(dictGetOrDefault('dict_registrable_canonical_override', 'owner_name', root, ''), ''),
         arrayJoin(if(length(org) > 0, org, ['']))
     ) AS organization,
 
@@ -1108,9 +1120,7 @@ SELECT
 
     org_id(organization)                 AS org_id,
     nbf, sn, lts
-FROM ct_certificates
-LEFT JOIN registrable_canonical_override AS co_reg ON registrable = co_reg.registrable
-LEFT JOIN registrable_canonical_override AS co_root ON root = co_root.registrable;
+FROM ct_certificates;
 
 /*-----------------------------------------------------------------------
   3.  Org -> certificate and org -> country lookup views
