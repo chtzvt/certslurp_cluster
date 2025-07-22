@@ -1060,6 +1060,7 @@ CREATE TABLE dns_flat
     depth        UInt8,
     wildcard     Bool,
     dn_tokens_full Array(String),
+    dns_hash UInt64 MATERIALIZED sipHash64(dn),
 
     organization String,
     ou           String,
@@ -1126,6 +1127,16 @@ FROM ct_certificates;
   3.  Org -> certificate and org -> country lookup views
 -----------------------------------------------------------------------*/
 
+/* ----------------------------------------------------------------------
+   org_locations: Flattened mapping of each certificate observation
+   to a specific (org_id, country, province, locality, tld) tuple.
+   Enables detailed, row-level lookups and granular filtering of org
+   activity by any combination of geographic or TLD attributes.
+
+   - Each row: one (org, country, province, locality, tld) combination.
+   - Fast filtering on country/tld via token bloom filter indexes.
+   - Useful for answering "which orgs exist in this region/TLD?".
+------------------------------------------------------------------------ */
 CREATE OR REPLACE TABLE org_locations
 (
     org_id   UInt64,
@@ -1140,6 +1151,11 @@ CREATE OR REPLACE TABLE org_locations
 ENGINE = MergeTree
 ORDER BY (country, province, locality, tld, org_id);
 
+/* ----------------------------------------------------------------------
+   mv_org_locations: Materialized view to populate org_locations,
+   lowercasing and normalizing all geo/TLD fields, omitting blanks.
+   Refreshes on a schedule to keep lookup data up to date.
+------------------------------------------------------------------------ */
 DROP VIEW IF EXISTS mv_org_locations;
 CREATE MATERIALIZED VIEW mv_org_locations
 REFRESH EVERY 1 DAY OFFSET 4 HOUR RANDOMIZE FOR 1 HOUR
@@ -1153,6 +1169,57 @@ SELECT
 FROM dns_flat
 WHERE country != '' AND organization != ''
 GROUP BY org_id, country, province, locality, tld;
+
+
+/* ----------------------------------------------------------------------
+   org_location_agg: Aggregated view of all locations and TLDs
+   observed for a given org_id. Collapses many org_locations rows
+   into a single row per org_id, with arrays for countries, provinces,
+   localities, and TLDs. Indexed with token bloom filters for
+   fast "array contains" queries on any location dimension.
+
+   - Each row: one org_id, arrays for all observed values.
+   - Great for "show me orgs in tld X or country Y" queries.
+   - Enables ultra-fast multi-value filters.
+------------------------------------------------------------------------ */
+CREATE OR REPLACE TABLE org_location_agg
+(
+    org_id    UInt64,
+    countries Array(String),
+    provinces Array(String),
+    localities Array(String),
+    tlds      Array(String),
+
+    INDEX idx_countries_bf  countries   TYPE tokenbf_v1(2048, 3, 0) GRANULARITY 4,
+    INDEX idx_tlds_bf       tlds        TYPE tokenbf_v1(2048, 3, 0) GRANULARITY 4,
+    INDEX idx_provinces_bf  provinces   TYPE tokenbf_v1(2048, 3, 0) GRANULARITY 4,
+    INDEX idx_localities_bf localities  TYPE tokenbf_v1(2048, 3, 0) GRANULARITY 4,
+
+    PRIMARY KEY org_id
+)
+ENGINE = MergeTree
+ORDER BY org_id;
+
+
+/* ----------------------------------------------------------------------
+   mv_org_location_agg: Materialized view that generates
+   org_location_agg, deduplicating and normalizing arrays,
+   and omitting empty values for all geo/TLD dimensions.
+   Keeps the aggregated locations in sync with source data.
+------------------------------------------------------------------------ */
+DROP VIEW IF EXISTS mv_org_location_agg;
+CREATE MATERIALIZED VIEW mv_org_location_agg
+REFRESH EVERY 1 DAY RANDOMIZE FOR 1 HOUR
+TO org_location_agg AS
+SELECT
+    org_id,
+    arrayFilter(x -> x != '', groupArrayDistinct(lowerUTF8(country))) AS countries,
+    arrayFilter(x -> x != '', groupArrayDistinct(lowerUTF8(province))) AS provinces,
+    arrayFilter(x -> x != '', groupArrayDistinct(lowerUTF8(locality))) AS localities,
+    arrayFilter(x -> x != '', groupArrayDistinct(lowerUTF8(tld))) AS tlds
+FROM dns_flat
+WHERE country != '' AND organization != ''
+GROUP BY org_id;
 
 /*-----------------------------------------------------------------------
   4.  Org -> registrable-domain roll-up
@@ -1668,7 +1735,10 @@ CREATE TABLE IF NOT EXISTS tech_signals
     -- Latest metadata
     ts           DateTime64(3, 'UTC'),
     confidence   Float32,
-    source       LowCardinality(String), -- Conventional defaults: ct_heuristic, active_scan, proxycurl
+    source       LowCardinality(String), -- Conventional defaults: ct_heuristic, active_scan
+
+    dns String MATERIALIZED (arrayFirst(x -> x.1 = 'dns', evidence).2),
+    dns_hash UInt64 MATERIALIZED (if(length(dns) > 0, sipHash64(dns), 0)),
 
     -- evidence_id: Uniquely identifies a normalized set of evidence for this detection.
     -- Computed as the SipHash64 of a string concatenation of all sorted evidence elements,
@@ -1689,14 +1759,28 @@ CREATE TABLE IF NOT EXISTS tech_signals
     ) DEFAULT 'active',
     is_negative  UInt8 DEFAULT 0,
 
-    INDEX idx_org_id (org_id) TYPE set(0) GRANULARITY 1
+    INDEX idx_org_id (org_id) TYPE set(0) GRANULARITY 1,
+    INDEX idx_dns (dns) TYPE tokenbf_v1(2048, 3, 0) GRANULARITY 4
 )
 ENGINE = ReplacingMergeTree(ts)
 PARTITION BY toYYYYMM(ts)
 ORDER BY (org_id, tech, evidence_id)
 SETTINGS 
     index_granularity = 8192,
-    min_bytes_for_wide_part = 134217728;
+    min_bytes_for_wide_part = 134217728,
+    deduplicate_merge_projection_mode = 'drop';
+
+ALTER TABLE tech_signals
+ADD PROJECTION IF NOT EXISTS p_by_org_tech_tld_country
+(
+    SELECT
+        org_id,
+        tech,
+        confidence,
+        ts,
+        dns_hash
+    ORDER BY (org_id, tech, dns_hash)
+);
 
 /* 6.3  CT-driven heuristic signals */
 DROP VIEW IF EXISTS mv_ct_tech_signals;
