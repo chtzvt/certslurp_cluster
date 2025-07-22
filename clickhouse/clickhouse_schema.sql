@@ -1729,6 +1729,8 @@ WHERE arrayExists(
           df.dn_tokens_full
       )
   AND positionCaseInsensitive(df.dn, tp.pattern) > 0
+  AND df.wildcard = false
+  AND df.depth > 0
 UNION ALL
 -- regex match (dict_regex_prefixes)
 SELECT
@@ -1749,6 +1751,8 @@ CROSS JOIN (
 ) AS rp
 WHERE (rp.regex_prefix = ''
        OR positionCaseInsensitive(df.dn, rp.regex_prefix) > 0)
+  AND df.wildcard = false
+  AND df.depth > 0
   AND match(df.dn, rp.pattern);
 
 
