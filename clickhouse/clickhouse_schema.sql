@@ -1148,7 +1148,7 @@ CREATE OR REPLACE TABLE org_locations
     INDEX idx_org_id (org_id) TYPE set(0) GRANULARITY 1,
     INDEX idx_tld (tld) TYPE set(0) GRANULARITY 1
 )
-ENGINE = MergeTree
+ENGINE = ReplacingMergeTree()
 ORDER BY (country, province, locality, tld, org_id);
 
 /* ----------------------------------------------------------------------
@@ -1159,17 +1159,31 @@ ORDER BY (country, province, locality, tld, org_id);
 DROP VIEW IF EXISTS mv_org_locations;
 CREATE MATERIALIZED VIEW mv_org_locations
 REFRESH EVERY 1 DAY OFFSET 4 HOUR RANDOMIZE FOR 1 HOUR
-TO org_locations AS
+APPEND TO org_locations AS
 SELECT
-    org_id,
-    lowerUTF8(country) AS country,
-    lowerUTF8(province) AS province,
-    lowerUTF8(locality) AS locality,
-    lowerUTF8(tld) AS tld
-FROM dns_flat
-WHERE country != '' AND organization != ''
-GROUP BY org_id, country, province, locality, tld;
-
+    multiIf(
+        canonical_org_name != '', org_id(canonical_org_name),
+        am.cluster_id IS NOT NULL, am.cluster_id,
+        org_id(df.organization)
+    ) AS org_id,
+    lowerUTF8(df.country)   AS country,
+    lowerUTF8(df.province)  AS province,
+    lowerUTF8(df.locality)  AS locality,
+    lowerUTF8(df.tld)       AS tld
+FROM (
+    SELECT *,
+        COALESCE(
+            NULLIF(dictGetOrDefault('dict_registrable_canonical_override', 'owner_name', registrable, ''), ''),
+            NULLIF(organization, ''),
+            ''
+        ) AS canonical_org_name
+    FROM dns_flat
+) AS df
+LEFT JOIN org_alias_map_expanded AS am
+    ON lowerUTF8(df.organization) = lowerUTF8(am.alias)
+WHERE organization != ''
+GROUP BY
+    org_id, country, province, locality, tld;
 
 /* ----------------------------------------------------------------------
    org_location_agg: Aggregated view of all locations and TLDs
@@ -1209,17 +1223,50 @@ ORDER BY org_id;
 ------------------------------------------------------------------------ */
 DROP VIEW IF EXISTS mv_org_location_agg;
 CREATE MATERIALIZED VIEW mv_org_location_agg
-REFRESH EVERY 1 DAY RANDOMIZE FOR 1 HOUR
+REFRESH EVERY 1 DAY DEPENDS ON mv_org_locations
 TO org_location_agg AS
 SELECT
     org_id,
-    arrayFilter(x -> x != '', groupArrayDistinct(lowerUTF8(country))) AS countries,
-    arrayFilter(x -> x != '', groupArrayDistinct(lowerUTF8(province))) AS provinces,
-    arrayFilter(x -> x != '', groupArrayDistinct(lowerUTF8(locality))) AS localities,
-    arrayFilter(x -> x != '', groupArrayDistinct(lowerUTF8(tld))) AS tlds
-FROM dns_flat
-WHERE country != '' AND organization != ''
+    arrayFilter(x -> x != '', groupArrayDistinct(lowerUTF8(country)))   AS countries,
+    arrayFilter(x -> x != '', groupArrayDistinct(lowerUTF8(province)))  AS provinces,
+    arrayFilter(x -> x != '', groupArrayDistinct(lowerUTF8(locality)))  AS localities,
+    arrayFilter(x -> x != '', groupArrayDistinct(lowerUTF8(tld)))       AS tlds
+FROM org_locations
+WHERE country != ''
 GROUP BY org_id;
+
+
+CREATE TABLE iso_countries
+(
+    name String,
+    alpha_2 FixedString(2),
+    alpha_3 FixedString(3),
+    country_code String,
+    iso_3166_2 String,
+    region String,
+    sub_region String,
+    intermediate_region String,
+    region_code String,
+    sub_region_code String,
+    intermediate_region_code String
+)
+ENGINE = MergeTree
+ORDER BY (alpha_2);
+
+INSERT INTO iso_countries
+SELECT
+    name,
+    `alpha-2` AS alpha_2,
+    `alpha-3` AS alpha_3,
+    `country-code` AS country_code,
+    `iso_3166-2` AS iso_3166_2,
+    region,
+    `sub-region` AS sub_region,
+    `intermediate-region` AS intermediate_region,
+    `region-code` AS region_code,
+    `sub-region-code` AS sub_region_code,
+    `intermediate-region-code` AS intermediate_region_code
+FROM url('https://raw.githubusercontent.com/packfiles/ISO-3166/refs/heads/master/all/all.json', 'JSONEachRow');
 
 /*-----------------------------------------------------------------------
   4.  Org -> registrable-domain roll-up
@@ -1654,6 +1701,59 @@ FROM cluster_with_top
 GROUP BY display_name
 ORDER BY cert_count DESC;
 
+/*---------------------------------------------------------------------------
+  org_alias_map_expanded
+
+  Purpose:
+    - Provides a complete, fast-mapping "resolver" table for mapping any known
+      organization alias (string) or its alias_id (sipHash64) to its canonical 
+      cluster (cluster_id), and the cluster's display_name.
+
+  Usage:
+    - Use to canonicalize organization references from any input string or alias.
+    - Can JOIN on `alias` (string) or `alias_id` (UInt64) to efficiently resolve 
+      to the cluster_id and canonical display name used throughout the system.
+    - This table is refreshed automatically from org_autocomplete_clustered.
+  
+  Difference from org_alias_map:
+    - org_alias_map is a pairwise mapping of alias_id <-> canonical_id based on 
+      shared registrables (roots). It is optimized for graph-style queries 
+      (e.g., find all org_ids in a cluster, compute cluster sizes, etc).
+    - org_alias_map_expanded is a *flat* mapping: for every alias string 
+      observed in a cluster, it maps directly to that cluster's canonical_id 
+      and display_name. It is ideal for typeahead/autocomplete, UI lookup, 
+      and anywhere fast canonicalization is required.
+
+  Example query:
+    -- Given an org name, get its canonical cluster id and display name:
+    SELECT cluster_id, display_name
+    FROM org_alias_map_expanded
+    WHERE alias = 'Fujitsu America Inc'
+-----------------------------------------------------------------------------*/
+
+CREATE OR REPLACE TABLE org_alias_map_expanded
+(
+    alias       String,
+    alias_id    UInt64,
+    cluster_id  UInt64,
+    display_name String,
+
+    INDEX idx_alias_id (alias_id) TYPE set(0) GRANULARITY 1
+)
+ENGINE = MergeTree
+ORDER BY (alias, cluster_id);
+
+DROP VIEW IF EXISTS org_alias_map_expanded_mv;
+CREATE MATERIALIZED VIEW org_alias_map_expanded_mv
+REFRESH EVERY 1 DAY DEPENDS ON org_autocomplete_clustered_mv
+TO org_alias_map_expanded AS
+SELECT
+    arrayJoin(aliases) AS alias,
+    org_id(alias) AS alias_id,
+    cluster_id,
+    display_name
+FROM org_autocomplete_clustered;
+
 /*-----------------------------------------------------------------------
   6.  Technology-matching components
 -----------------------------------------------------------------------*/
@@ -1764,7 +1864,7 @@ CREATE TABLE IF NOT EXISTS tech_signals
 )
 ENGINE = ReplacingMergeTree(ts)
 PARTITION BY toYYYYMM(ts)
-ORDER BY (org_id, tech, evidence_id)
+ORDER BY (tech, evidence_id, dns_hash)
 SETTINGS 
     index_granularity = 8192,
     min_bytes_for_wide_part = 134217728,
@@ -1787,58 +1887,83 @@ DROP VIEW IF EXISTS mv_ct_tech_signals;
 CREATE MATERIALIZED VIEW mv_ct_tech_signals
 REFRESH EVERY 1 DAY OFFSET 6 HOUR RANDOMIZE FOR 1 HOUR
 APPEND TO tech_signals AS
--- pattern match (dict_tech_patterns)
 SELECT
-    df.lts                                                AS ts,
-    COALESCE(ogr.org_id, df.org_id)                       AS org_id,        -- use canonical if available
-    df.registrable                                        AS registrable,
-    tp.tech                                               AS tech,
-    tp.weight                                             AS confidence,
-    'ct_heuristic'                                        AS source,
-    arraySort(arrayDistinct([tuple('dns', df.dn)]))       AS evidence,
-    0                                                     AS is_negative
-FROM dns_flat AS df
-LEFT JOIN org_root_sets AS ogr
-  ON df.registrable = ogr.registrable AND ogr.allow_aliasing = 1
+    df.lts AS ts,
+    CASE
+        WHEN canonical_org_name != '' THEN org_id(canonical_org_name)
+        WHEN am.cluster_id IS NOT NULL THEN am.cluster_id
+        ELSE org_id(df.organization)
+    END AS org_id,
+    df.registrable,
+    tp.tech,
+    tp.weight AS confidence,
+    'ct_heuristic' AS source,
+    arraySort(arrayDistinct([tuple('dns', df.dn)])) AS evidence,
+    0 AS is_negative
+FROM (
+    SELECT
+        *,
+        COALESCE(
+            NULLIF(dictGetOrDefault('dict_registrable_canonical_override', 'owner_name', registrable, ''), ''),
+            NULLIF(organization, ''),
+            ''
+        ) AS canonical_org_name
+    FROM dns_flat
+) AS df
 CROSS JOIN (
     SELECT pattern, tech, weight
     FROM dict_tech_patterns
     WHERE is_regex = 0
 ) AS tp
-WHERE arrayExists(
-          tok -> arrayExists(
-                     pat -> positionCaseInsensitive(tok, pat) > 0,
-                     (SELECT groupArray(token) FROM tech_tokens)
-                 ),
-          df.dn_tokens_full
-      )
-  AND positionCaseInsensitive(df.dn, tp.pattern) > 0
-  AND df.wildcard = false
-  AND df.depth > 0
+LEFT JOIN org_alias_map_expanded AS am
+    ON lowerUTF8(df.organization) = lowerUTF8(am.alias)
+WHERE
+    arrayExists(
+        tok -> arrayExists(
+            pat -> positionCaseInsensitive(tok, pat) > 0,
+            (SELECT groupArray(token) FROM tech_tokens)
+        ),
+        df.dn_tokens_full
+    )
+    AND positionCaseInsensitive(df.dn, tp.pattern) > 0
+    AND df.wildcard = false
+    AND df.depth > 0
 UNION ALL
--- regex match (dict_regex_prefixes)
+-- Regex match (dict_regex_prefixes)
 SELECT
-    df.lts                                                AS ts,
-    COALESCE(ogr.org_id, df.org_id)                       AS org_id,        -- use canonical if available
-    df.registrable                                        AS registrable,
-    rp.tech                                               AS tech,
-    rp.weight                                             AS confidence,
-    'ct_heuristic'                                        AS source,
-    arraySort(arrayDistinct([tuple('dns', df.dn)]))       AS evidence,
-    0                                                     AS is_negative
-FROM dns_flat AS df
-LEFT JOIN org_root_sets AS ogr
-  ON df.registrable = ogr.registrable AND ogr.allow_aliasing = 1
+    df.lts AS ts,
+    CASE
+        WHEN canonical_org_name != '' THEN org_id(canonical_org_name)
+        WHEN am.cluster_id IS NOT NULL THEN am.cluster_id
+        ELSE org_id(df.organization)
+    END AS org_id,
+    df.registrable,
+    rp.tech,
+    rp.weight AS confidence,
+    'ct_heuristic' AS source,
+    arraySort(arrayDistinct([tuple('dns', df.dn)])) AS evidence,
+    0 AS is_negative
+FROM (
+    SELECT
+        *,
+        COALESCE(
+            NULLIF(dictGetOrDefault('dict_registrable_canonical_override', 'owner_name', registrable, ''), ''),
+            NULLIF(organization, ''),
+            ''
+        ) AS canonical_org_name
+    FROM dns_flat
+) AS df
 CROSS JOIN (
     SELECT regex_prefix, pattern, tech, weight
     FROM dict_regex_prefixes
 ) AS rp
-WHERE (rp.regex_prefix = ''
-       OR positionCaseInsensitive(df.dn, rp.regex_prefix) > 0)
-  AND df.wildcard = false
-  AND df.depth > 0
-  AND match(df.dn, rp.pattern);
-
+LEFT JOIN org_alias_map_expanded AS am
+    ON lowerUTF8(df.organization) = lowerUTF8(am.alias)
+WHERE
+    (rp.regex_prefix = '' OR positionCaseInsensitive(df.dn, rp.regex_prefix) > 0)
+    AND df.wildcard = false
+    AND df.depth > 0
+    AND match(df.dn, rp.pattern);
 
 /* 6.4  Aggregated truth table  (org × tech) */
 DROP TABLE IF EXISTS org_tech_facts;
