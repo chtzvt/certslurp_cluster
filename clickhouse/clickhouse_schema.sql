@@ -1512,8 +1512,63 @@ HAVING organization != '';
   5.  Organization SipHash signatures + autocomplete (fuzzy backbone)
 -----------------------------------------------------------------------*/
 
-/* This table is automatically maintained by org_alias_map_mv.
-   Do not manually write to this table, it will refresh on a schedule. */
+/*----------------------------------------------------------------------------
+ org_alias_map: Organization Alias Cluster Mapping
+
+ This table is automatically maintained by org_alias_map_mv.
+ Do not manually write to this table, it will refresh on a schedule. 
+------------------------------------------------------------------------------
+
+ This materialized view constructs a mapping between pairs of organization IDs
+ (org_id) that appear to represent aliases—i.e., different names used for the 
+ same real-world organization—based on shared registrable domains observed in 
+ certificate transparency logs.
+
+ For every pair of org_ids that share registrables (i.e., both have appeared as
+ certificate subjects for the same apex domain), a row is emitted if the pair
+ meets the following heuristics:
+
+   - Both orgs are eligible for aliasing (allow_aliasing = 1).
+   - They share a minimum required number of registrables (inter_cnt >= N).
+   - Both orgs have sufficient domain proximity (min_depth thresholds).
+
+ The resulting table is used for:
+   - Clustering orgs for autocomplete, search, and analytics.
+   - Deduplicating org-centric analytics and reducing noisy splits.
+
+------------------------------------------------------------------------------
+ HEURISTIC: inter_cnt (shared registrables threshold)
+
+ The `inter_cnt` column measures how many distinct registrable domains the
+ org_id pair has in common (i.e., how many roots both have certificates for).
+ This serves as a strong, practical signal that two org_ids represent
+ different variants/aliases for the same entity.
+
+ *Rationale:*
+   - It's common for companies to appear under multiple org names due to M&A,
+     subsidiaries, spelling/locale differences, or data entry variation.
+   - But accidental collisions (i.e., two unrelated orgs both touching the same
+     domain) are rare, especially as the count increases.
+
+ *Tuning Guidance:*
+   - A higher `inter_cnt` threshold (e.g., >= 5) yields higher-precision
+     clusters (less risk of over-aggregation), but lower recall (some true
+     aliases are missed if they only overlap on a few domains).
+   - Lowering the threshold (e.g., to 3) increases recall, at the risk of
+     pulling together unrelated orgs with coincidental overlap (e.g., 
+     resellers, resold SaaS, CDNs).
+
+   - Tune `inter_cnt` by examining the distribution (see example query below).
+     A good rule of thumb: set the threshold just high enough to avoid most
+     accidental aliasing, but low enough to catch real-world org variants.
+     For most corp/brand CT datasets, 3–5 is a reasonable starting point.
+
+     -- Example: Distribution of inter_cnt (shared registrable roots)
+     SELECT inter_cnt, count(*) FROM org_alias_map GROUP BY inter_cnt ORDER BY inter_cnt DESC
+
+   - Consider complementing this with domain depth and infra/super-issuer
+     filtering to avoid clustering infrastructure providers.
+*/
 CREATE OR REPLACE TABLE org_alias_map
 (
     alias_id     UInt64,
@@ -1550,7 +1605,7 @@ ADD PROJECTION IF NOT EXISTS p_root_counts
 
 DROP VIEW IF EXISTS org_alias_map_mv;
 CREATE MATERIALIZED VIEW org_alias_map_mv
-REFRESH EVERY 1 DAY OFFSET 5 HOUR RANDOMIZE FOR 1 HOUR
+REFRESH EVERY 1 DAY DEPENDS ON org_root_sets_mv
 TO org_alias_map AS
 SELECT
     a.org_id AS alias_id,
@@ -1565,7 +1620,7 @@ JOIN org_root_sets b
 WHERE a.allow_aliasing = 1
   AND b.allow_aliasing = 1
 GROUP BY alias_id, canonical_id
-HAVING min(a.min_depth) = 2 AND min(b.min_depth) = 2 AND inter_cnt >= 3;
+HAVING min(a.min_depth) <= 1 AND min(b.min_depth) <= 1 AND inter_cnt >= 2 AND (inter_cnt / uni_cnt) >= 0.5;
 
 
 /* This table is automatically maintained by org_autocomplete_clustered_mv.
@@ -1981,14 +2036,14 @@ ORDER BY (org_id, last_seen, tech);
 
 DROP VIEW IF EXISTS mv_org_tech;
 CREATE MATERIALIZED VIEW mv_org_tech
-REFRESH AFTER 4 HOUR RANDOMIZE FOR 1 HOUR
+REFRESH EVERY 8 HOUR RANDOMIZE FOR 1 HOUR DEPENDS ON mv_ct_tech_signals
 TO org_tech_facts AS
 SELECT
     org_id,
     tech,
     IF(max(is_negative) = 1, 0, max(confidence)) AS confidence,
     max(ts) AS last_seen
-FROM tech_signals
+FROM tech_signals FINAL 
 GROUP BY org_id, tech;
 
 /*-----------------------------------------------------------------------
