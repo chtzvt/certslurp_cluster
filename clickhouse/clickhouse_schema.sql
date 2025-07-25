@@ -2106,6 +2106,7 @@ INSERT INTO tech_patterns (id, pattern, is_regex, tech, weight) VALUES
 (6,'splunk',   0,'Splunk',    0.5),
 (7,'jenkins',  0,'Jenkins',   0.5),
 (8,'jfrog',    0,'JFrog',     0.5);
+(9,'sharepoint',    0,'SharePoint',     0.5);
 
 INSERT INTO tech_patterns (id, pattern, is_regex, regex_prefix, tech, weight)
 VALUES (9, '^([a-z0-9-]+\\.)+ghe\\.com$', 1, 'ghe.com', 'GitHub Enterprise Cloud (Data Residency)', 1.0);
