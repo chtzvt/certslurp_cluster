@@ -1611,7 +1611,7 @@ SELECT
     a.org_id AS alias_id,
     b.org_id AS canonical_id,
     groupArrayDistinct(a.registrable) AS shared,
-    count() AS inter_cnt,
+    uniqExact(a.registrable) AS inter_cnt,
     uniqExact(arrayConcat([a.registrable], [b.registrable])) AS uni_cnt
 FROM org_root_sets a
 JOIN org_root_sets b
@@ -1620,7 +1620,7 @@ JOIN org_root_sets b
 WHERE a.allow_aliasing = 1
   AND b.allow_aliasing = 1
 GROUP BY alias_id, canonical_id
-HAVING min(a.min_depth) <= 1 AND min(b.min_depth) <= 1 AND inter_cnt >= 2 AND (inter_cnt / uni_cnt) >= 0.5;
+HAVING min(a.min_depth) <= 1 AND min(b.min_depth) <= 1 AND inter_cnt >= 4 AND (inter_cnt / uni_cnt) >= 0.5;
 
 
 /* This table is automatically maintained by org_autocomplete_clustered_mv.
@@ -1693,6 +1693,21 @@ Notes:
     generally will not dominate clusters unless they are true root owners.
     - If a name appears in multiple clusters (e.g. due to acquisition or
     poor root set resolution), it may appear in multiple alias lists.
+
+
+If clustering is too broad, use the following query to debug:
+
+SELECT
+    am.alias_id,
+    am.canonical_id,
+    am.inter_cnt,
+    am.shared
+FROM org_autocomplete_clustered AS ac
+JOIN org_alias_map AS am
+    ON ac.cluster_id = am.canonical_id OR ac.cluster_id = am.alias_id
+WHERE ac.cluster_id = <cluster ID>
+ORDER BY am.inter_cnt DESC
+
 */
 DROP VIEW IF EXISTS org_autocomplete_clustered_mv;
 CREATE MATERIALIZED VIEW org_autocomplete_clustered_mv
