@@ -279,6 +279,15 @@ WHERE (f.tech = 'GitLab') AND (f.confidence >= 0.5) AND (f.org_id IN (
 ORDER BY f.last_seen DESC
 LIMIT 100;
 
+Count of technology detections *by distinct registrable*:
+SELECT
+    tech,
+    countDistinct(registrable) AS registrable_count
+FROM tech_signals
+FINAL
+GROUP BY tech
+ORDER BY registrable_count DESC
+
 
 * Rollup of technology detections per (organization cluster, tech), with display names and de-duplicated org clustering.
 For every technology (t.tech) detected:
@@ -1938,7 +1947,11 @@ ORDER BY (tech, evidence_id, dns_hash)
 SETTINGS 
     index_granularity = 8192,
     min_bytes_for_wide_part = 134217728,
-    deduplicate_merge_projection_mode = 'drop';
+    deduplicate_merge_projection_mode = 'drop',
+    old_parts_lifetime = 86400,
+    cleanup_delay_period = 120,
+    cleanup_delay_period_random_add = 25,
+    merge_selecting_sleep_ms = 10000;
 
 ALTER TABLE tech_signals
 ADD PROJECTION IF NOT EXISTS p_by_org_tech_tld_country
